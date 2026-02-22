@@ -1,3 +1,12 @@
+
+Active research areas:
+- [Prompt routing and tiered execution](#tiers)
+- Knowledge preamble
+  - [CLaRa for better knowledge retrieval](#clara)
+  - BGE-large reranking
+- Auto-build and LSP feedback
+- ZeroLLM (cmd execution intent, T3 compiled skills)
+
 ## Tiers
 
 oc has 4 prompt-execution tiers, moving up or down based on interaction to reduce LLM round-trips and tool calls.
