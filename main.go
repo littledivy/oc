@@ -523,17 +523,7 @@ func startEscInterruptWatcher(onInterrupt func()) func() {
 		return func() {}
 	}
 
-	// Re-enable OPOST for output processing, and disable VDISCARD so
-	// Ctrl+O (byte 15) passes through to the application instead of being
-	// swallowed by the macOS tty driver.
-	patchTermios := func() {
-		if termios, err := unix.IoctlGetTermios(fd, unix.TIOCGETA); err == nil {
-			termios.Oflag |= unix.OPOST
-			termios.Cc[unix.VDISCARD] = 0
-			unix.IoctlSetTermios(fd, unix.TIOCSETA, termios)
-		}
-	}
-	patchTermios()
+	patchRawTermios(fd)
 
 	pauseCh := make(chan struct{}, 1)
 	resumeCh := make(chan struct{}, 1)
@@ -575,7 +565,7 @@ func startEscInterruptWatcher(onInterrupt func()) func() {
 				if newState, err := term.MakeRaw(fd); err == nil {
 					oldState = newState
 				}
-				patchTermios()
+				patchRawTermios(fd)
 				continue
 			default:
 			}
