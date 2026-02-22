@@ -936,6 +936,38 @@ func (j *JIT) FindMatch(prompt string) *MatchResult {
 	return &MatchResult{Strategy: "none", Confidence: 0}
 }
 
+// embeddingMatch embeds the prompt and compares it against all pattern embeddings
+// using cosine similarity. Returns the best match if above a minimum threshold.
+func (j *JIT) embeddingMatch(prompt string) *MatchResult {
+	if len(j.Patterns.Patterns) == 0 {
+		return nil
+	}
+	promptEmb := ollamaEmbed(prompt)
+	if promptEmb == nil {
+		return nil
+	}
+	var bestPattern *Pattern
+	bestSim := 0.0
+	for _, p := range j.Patterns.Patterns {
+		if len(p.Embedding) == 0 {
+			continue
+		}
+		sim := cosineSimilarity(promptEmb, p.Embedding)
+		if sim > bestSim {
+			bestSim = sim
+			bestPattern = p
+		}
+	}
+	if bestPattern == nil {
+		return nil
+	}
+	return &MatchResult{
+		Pattern:    bestPattern,
+		Confidence: bestSim,
+		Strategy:   "embedding",
+	}
+}
+
 // matchByLocalLLM sends a structured prompt to the local Ollama model for classification.
 func (j *JIT) matchByLocalLLM(prompt string) *MatchResult {
 	if len(j.Patterns.Patterns) == 0 {
@@ -2254,6 +2286,13 @@ func (ps *PatternStore) FindByID(id string) *Pattern {
 		}
 	}
 	return nil
+}
+
+// RebuildAllDescriptions rebuilds the Description field on every pattern.
+func (ps *PatternStore) RebuildAllDescriptions() {
+	for _, p := range ps.Patterns {
+		p.rebuildDescription()
+	}
 }
 
 // filterWords removes filler/stop words from a word list.
