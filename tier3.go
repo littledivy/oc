@@ -4,7 +4,6 @@ import (
 	"crypto/sha256"
 	"encoding/json"
 	"fmt"
-	"math"
 	"os"
 	"path/filepath"
 	"strings"
@@ -64,37 +63,17 @@ var executionIntentCache = struct {
 	byKey: make(map[string]executionIntentDecision),
 }
 
-type executionIntentPrototype struct {
-	Label string
-	Text  string
-	Emb   []float64
-}
-
-var executionIntentPrototypesState = struct {
-	sync.Once
-	protos []executionIntentPrototype
-}{}
-
-type commandFitPrototype struct {
-	Label string
-	Text  string
-	Emb   []float64
-}
-
-var commandFitPrototypesState = struct {
-	sync.Once
-	protos []commandFitPrototype
-}{}
 
 func NewJIT() *JIT {
 	k := LoadKnowledge()
 	k.compilePreamble()
 	traceLog("[jit] initializing")
 	nt := LoadNeedTemplates()
-	nt.EnsureIntentSeeds()
+	ps := LoadPatterns()
+	ps.RebuildAllDescriptions()
 	return &JIT{
 		Knowledge:     k,
-		Patterns:      LoadPatterns(),
+		Patterns:      ps,
 		Scripts:       LoadScripts(),
 		CodeSkills:    LoadCodeSkills(),
 		TraceIndex:    LoadTraceIndex(),
@@ -111,7 +90,7 @@ func (j *JIT) Plan(prompt string, auth *AuthMethod) *ExecutionPlan {
 
 	if script := j.Scripts.MatchScript(prompt); script != nil {
 		if cmd, ok := scriptSingleAssertCommand(script); ok {
-			if execNow, exclusive, fit, ic, src := classifyExecutionIntent(prompt, cmd, auth); execNow && exclusive && fit && ic >= executionIntentThreshold {
+			if execNow, exclusive, fit, ic, src := classifyExecutionIntent(prompt, cmd); execNow && exclusive && fit && ic >= executionIntentThreshold {
 				plan.Tier = Tier3
 				plan.Script = script
 				traceLog("[jit] tier 3: script %q (%d uses, %d failures; %s %.2f)", script.Name, script.Uses, script.Failures, src, ic)
@@ -126,7 +105,7 @@ func (j *JIT) Plan(prompt string, auth *AuthMethod) *ExecutionPlan {
 		}
 	}
 
-	match := j.FindMatch(prompt, auth)
+	match := j.FindMatch(prompt)
 	if match != nil && match.Pattern != nil && match.Confidence >= 0.8 {
 		plan.Tier = Tier2
 		plan.Pattern = match.Pattern
@@ -137,7 +116,7 @@ func (j *JIT) Plan(prompt string, auth *AuthMethod) *ExecutionPlan {
 		if j.patternIntent(match.Pattern.ID) == "run_checks" {
 			if step, ok := stableAssertBashStep(match.Pattern); ok {
 				cmd := scriptStepCommand(step)
-				if execNow, exclusive, fit, ic, src := classifyExecutionIntent(prompt, cmd, auth); execNow && exclusive && fit && ic >= executionIntentThreshold {
+				if execNow, exclusive, fit, ic, src := classifyExecutionIntent(prompt, cmd); execNow && exclusive && fit && ic >= executionIntentThreshold {
 					plan.Tier = Tier3
 					plan.Script = &Script{
 						ID:       "adhoc_" + match.Pattern.ID,
@@ -153,7 +132,7 @@ func (j *JIT) Plan(prompt string, auth *AuthMethod) *ExecutionPlan {
 
 		if step, ok := singleStableAssertBashStep(match.Pattern); ok {
 			cmd := scriptStepCommand(step)
-			if execNow, exclusive, fit, ic, src := classifyExecutionIntent(prompt, cmd, auth); execNow && exclusive && fit && ic >= executionIntentThreshold {
+			if execNow, exclusive, fit, ic, src := classifyExecutionIntent(prompt, cmd); execNow && exclusive && fit && ic >= executionIntentThreshold {
 				plan.Tier = Tier3
 				plan.Script = &Script{
 					ID:       "adhoc_" + match.Pattern.ID,
@@ -296,7 +275,7 @@ func scriptSingleAssertCommand(script *Script) (string, bool) {
 	return cmd, true
 }
 
-func classifyExecutionIntent(prompt, command string, auth *AuthMethod) (bool, bool, bool, float64, string) {
+func classifyExecutionIntent(prompt, command string) (bool, bool, bool, float64, string) {
 	key := executionIntentCacheKey(prompt, command)
 	if key != "" {
 		executionIntentCache.RLock()
@@ -319,259 +298,7 @@ func classifyExecutionIntent(prompt, command string, auth *AuthMethod) (bool, bo
 		traceLog("[jit] intent gate: logreg abstain (%s)", reason)
 	}
 
-	if execNow, exclusive, fit, conf, ok := classifyExecutionIntentEmbedding(prompt, command); ok {
-		cacheExecutionIntent(key, execNow, exclusive, fit, conf)
-		return execNow, exclusive, fit, conf, "embedding_intent"
-	}
-
-	classifyPrompt := fmt.Sprintf(`Classify intent for command execution.
-
-User prompt: %q
-Candidate command: %q
-
-Return JSON only (no prose, no markdown, no code fences):
-{"intent":"execute"|"discuss","exclusive":true|false,"confidence":0.0-1.0}
-
-Interpretation:
-- intent=execute, exclusive=true: user only wants this command run
-- intent=execute, exclusive=false: user also asked for other work (e.g. "show file and run tests")
-- intent=discuss: user asks about status/strategy; do not auto-run
-
-Important disambiguation:
-- Bare command-style prompts are execute requests.
-- If the prompt is an imperative command (for example "go test", "cargo test", "pytest", "run go test"), classify as execute.
-- If the prompt asks about state/status/results (for example "do tests pass?", "did tests pass?", "what tests do we have"), classify as discuss.
-
-Examples:
-- "go test" => execute, exclusive=true
-- "run go test" => execute, exclusive=true
-- "show me README and run go test" => execute, exclusive=false
-- "what tests do we have" => discuss
-- "should we add more tests" => discuss
-- "do tests pass" => discuss
-- "only run 1 test" with candidate "go test ./..." => execute with command_fit=false`, prompt, command)
-
-	classifyPrompt = classifyPrompt + `
-Also include command_fit=true only if the candidate command satisfies the user's requested scope/constraints exactly enough.
-Examples:
-- prompt "run go test" + command "go test ./..." => command_fit=true
-- prompt "only run 1 test" + command "go test ./..." => command_fit=false
-- prompt "run tests for package x" + command "go test ./..." => command_fit=false`
-
-	parse := func(raw string) (bool, bool, bool, float64, bool) {
-		start := strings.Index(raw, "{")
-		end := strings.LastIndex(raw, "}")
-		if start < 0 || end < 0 || end <= start {
-			return false, false, false, 0, false
-		}
-		var out struct {
-			Intent     string  `json:"intent"`
-			Exclusive  bool    `json:"exclusive"`
-			CommandFit bool    `json:"command_fit"`
-			Confidence float64 `json:"confidence"`
-		}
-		if json.Unmarshal([]byte(raw[start:end+1]), &out) != nil {
-			return false, false, false, 0, false
-		}
-		intent := strings.TrimSpace(strings.ToLower(out.Intent))
-		if intent != "execute" && intent != "discuss" {
-			return false, false, false, 0, false
-		}
-		return intent == "execute", out.Exclusive, out.CommandFit, out.Confidence, true
-	}
-
-	if ollamaAvailable() {
-		if raw := callOllamaDeterministic(classifyPrompt, 80); raw != "" {
-			if execNow, exclusive, fit, conf, ok := parse(raw); ok {
-				cacheExecutionIntent(key, execNow, exclusive, fit, conf)
-				return execNow, exclusive, fit, conf, "ollama_intent"
-			}
-		}
-	}
-	if auth != nil {
-		if raw, err := classifierChat([]Message{{Role: "user", Content: classifyPrompt}}, auth); err == nil && raw != "" {
-			if execNow, exclusive, fit, conf, ok := parse(raw); ok {
-				cacheExecutionIntent(key, execNow, exclusive, fit, conf)
-				return execNow, exclusive, fit, conf, "api_intent"
-			}
-		}
-	}
 	return false, false, false, 0, "none"
-}
-
-func classifyExecutionIntentEmbedding(prompt, command string) (bool, bool, bool, float64, bool) {
-	if !ollamaAvailable() {
-		return false, false, false, 0, false
-	}
-	query := strings.TrimSpace(prompt)
-	if query == "" {
-		return false, false, false, 0, false
-	}
-	emb := ollamaEmbed(query)
-	if len(emb) == 0 {
-		return false, false, false, 0, false
-	}
-	protos := executionIntentPrototypes()
-	if len(protos) == 0 {
-		return false, false, false, 0, false
-	}
-
-	bestByLabel := map[string]float64{
-		"execute_only": -1,
-		"execute_plus": -1,
-		"discuss":      -1,
-	}
-	for _, p := range protos {
-		if len(p.Emb) == 0 {
-			continue
-		}
-		sim := cosineSimilarity(emb, p.Emb)
-		if sim > bestByLabel[p.Label] {
-			bestByLabel[p.Label] = sim
-		}
-	}
-
-	topLabel := ""
-	top := -1.0
-	second := -1.0
-	for label, score := range bestByLabel {
-		if score > top {
-			second = top
-			top = score
-			topLabel = label
-		} else if score > second {
-			second = score
-		}
-	}
-	if topLabel == "" || top < 0.52 {
-		return false, false, false, 0, false
-	}
-	margin := top - second
-	if margin < 0.02 {
-		return false, false, false, 0, false
-	}
-
-	execNow := topLabel == "execute_only" || topLabel == "execute_plus"
-	exclusive := topLabel == "execute_only"
-	fit, fitConf, fitOK := classifyCommandFitEmbedding(prompt, command)
-	if !fitOK {
-		fit = true
-		fitConf = 0.6
-	}
-
-	conf := clamp01(0.45 + (top-0.52)*1.1 + margin*1.8)
-	if execNow {
-		conf = clamp01((conf*0.75 + fitConf*0.25))
-	}
-
-	if conf < 0.80 {
-		return false, false, false, 0, false
-	}
-
-	return execNow, exclusive, fit, conf, true
-}
-
-func classifyCommandFitEmbedding(prompt, command string) (bool, float64, bool) {
-	if !ollamaAvailable() {
-		return false, 0, false
-	}
-	query := fmt.Sprintf("user request: %s\ncandidate command: %s", strings.TrimSpace(prompt), strings.TrimSpace(command))
-	emb := ollamaEmbed(query)
-	if len(emb) == 0 {
-		return false, 0, false
-	}
-	protos := commandFitPrototypes()
-	if len(protos) == 0 {
-		return false, 0, false
-	}
-
-	bestFit := -1.0
-	bestUnfit := -1.0
-	for _, p := range protos {
-		if len(p.Emb) == 0 {
-			continue
-		}
-		sim := cosineSimilarity(emb, p.Emb)
-		if p.Label == "fit" && sim > bestFit {
-			bestFit = sim
-		}
-		if p.Label == "unfit" && sim > bestUnfit {
-			bestUnfit = sim
-		}
-	}
-	if bestFit < 0 && bestUnfit < 0 {
-		return false, 0, false
-	}
-	if bestFit < 0 {
-		return false, clamp01((bestUnfit + 1) / 2), true
-	}
-	if bestUnfit < 0 {
-		return true, clamp01((bestFit + 1) / 2), true
-	}
-
-	diff := bestFit - bestUnfit
-	conf := clamp01(0.5 + math.Abs(diff)*1.7)
-	return diff >= 0, conf, true
-}
-
-func executionIntentPrototypes() []executionIntentPrototype {
-	executionIntentPrototypesState.Do(func() {
-		seed := []executionIntentPrototype{
-			{Label: "execute_only", Text: "run go test"},
-			{Label: "execute_only", Text: "go test"},
-			{Label: "execute_only", Text: "execute the test suite"},
-			{Label: "execute_only", Text: "run tests now"},
-			{Label: "execute_only", Text: "rerun tests"},
-			{Label: "execute_only", Text: "please run cargo test"},
-			{Label: "execute_only", Text: "run pytest"},
-			{Label: "execute_only", Text: "run go build"},
-			{Label: "execute_only", Text: "go build"},
-			{Label: "execute_only", Text: "build the project"},
-			{Label: "execute_only", Text: "run cargo build"},
-			{Label: "execute_only", Text: "npm run build"},
-			{Label: "execute_only", Text: "run the build"},
-			{Label: "execute_plus", Text: "show me README and run go test"},
-			{Label: "execute_plus", Text: "open the file then run tests"},
-			{Label: "execute_plus", Text: "run tests and explain failures"},
-			{Label: "execute_plus", Text: "run go test and summarize output"},
-			{Label: "execute_plus", Text: "read docs and run test suite"},
-			{Label: "execute_plus", Text: "build and show me the errors"},
-			{Label: "discuss", Text: "do tests pass"},
-			{Label: "discuss", Text: "did tests pass"},
-			{Label: "discuss", Text: "what tests do we have"},
-			{Label: "discuss", Text: "should we add more tests"},
-			{Label: "discuss", Text: "why are tests failing"},
-			{Label: "discuss", Text: "which tests are flaky"},
-			{Label: "discuss", Text: "explain test status"},
-			{Label: "discuss", Text: "does the build work"},
-			{Label: "discuss", Text: "what build errors do we have"},
-		}
-		for i := range seed {
-			seed[i].Emb = ollamaEmbed(seed[i].Text)
-		}
-		executionIntentPrototypesState.protos = seed
-	})
-	return executionIntentPrototypesState.protos
-}
-
-func commandFitPrototypes() []commandFitPrototype {
-	commandFitPrototypesState.Do(func() {
-		seed := []commandFitPrototype{
-			{Label: "fit", Text: "user requests running the full test suite and candidate command runs full suite"},
-			{Label: "fit", Text: "run tests in repository with default command"},
-			{Label: "fit", Text: "execute complete checks now"},
-			{Label: "fit", Text: "run all tests and nothing else"},
-			{Label: "unfit", Text: "user asks to run only one test but candidate command runs all tests"},
-			{Label: "unfit", Text: "user asks for package specific tests but candidate command is broad"},
-			{Label: "unfit", Text: "user asks for one file tests only, candidate command runs whole suite"},
-			{Label: "unfit", Text: "request is for constrained subset not full test run"},
-		}
-		for i := range seed {
-			seed[i].Emb = ollamaEmbed(seed[i].Text)
-		}
-		commandFitPrototypesState.protos = seed
-	})
-	return commandFitPrototypesState.protos
 }
 
 func clamp01(v float64) float64 {
@@ -643,9 +370,6 @@ func (j *JIT) Record(prompt string, trace *IRTrace) {
 		}
 		if sigOverlap >= 0.8 || embSim >= 0.80 {
 			j.NeedTemplates.LearnFromTrace(trace, p)
-			if tmpl := j.NeedTemplates.FindByPattern(p.ID); tmpl != nil {
-				j.NeedTemplates.LearnIntentCategory(tmpl, sig, prompt)
-			}
 			break
 		}
 	}
@@ -1246,13 +970,14 @@ type IRop struct {
 
 // IRTrace is a compiled trace — the normalized form of a workflow.
 type IRTrace struct {
-	ID        string     `json:"id"`
-	Trigger   string     `json:"trigger"`
-	TriggerID string     `json:"trigger_id"`
-	Ops       []IRop     `json:"ops"`
-	Signature string     `json:"signature"`
-	Created   time.Time  `json:"created"`
-	Stats     TraceStats `json:"stats"`
+	ID         string     `json:"id"`
+	Trigger    string     `json:"trigger"`
+	TriggerID  string     `json:"trigger_id"`
+	RawTrigger string     `json:"raw_trigger,omitempty"` // original user prompt (unnormalized)
+	Ops        []IRop     `json:"ops"`
+	Signature  string     `json:"signature"`
+	Created    time.Time  `json:"created"`
+	Stats      TraceStats `json:"stats"`
 }
 
 // CompileIR converts raw trace effects into IR.

@@ -6,7 +6,6 @@ import (
 	"strconv"
 	"strings"
 	"testing"
-	"time"
 )
 
 func TestParseCompilerErrors_Go(t *testing.T) {
@@ -123,45 +122,3 @@ func TestReadSourceContext_EdgeCases(t *testing.T) {
 	}
 }
 
-func TestEnrichBuildErrors(t *testing.T) {
-	tmp := t.TempDir()
-	f := filepath.Join(tmp, "main.go")
-	os.WriteFile(f, []byte("package main\n\nfunc main() {\n\tfoo()\n}\n"), 0o644)
-
-	buildResult := &AutoBuildResult{
-		Output:  f + ":4:2: undefined: foo\n",
-		IsError: true,
-		Elapsed: 100 * time.Millisecond,
-		Command: "go build ./...",
-	}
-
-	enriched := EnrichBuildErrors(buildResult, "go")
-	if enriched == "" {
-		t.Fatal("expected enriched output")
-	}
-	if !strings.Contains(enriched, "error context") {
-		t.Fatal("expected 'error context' header")
-	}
-	if !strings.Contains(enriched, "foo()") {
-		t.Fatal("expected source context with foo()")
-	}
-}
-
-func TestEnrichBuildErrors_NilOrSuccess(t *testing.T) {
-	if EnrichBuildErrors(nil, "go") != "" {
-		t.Fatal("expected empty for nil")
-	}
-	if EnrichBuildErrors(&AutoBuildResult{Output: "ok", IsError: false}, "go") != "" {
-		t.Fatal("expected empty for success")
-	}
-}
-
-func TestEnrichBuildErrors_NoErrors(t *testing.T) {
-	result := &AutoBuildResult{
-		Output:  "some random output with no parseable errors\n",
-		IsError: true,
-	}
-	if EnrichBuildErrors(result, "go") != "" {
-		t.Fatal("expected empty when no errors parsed")
-	}
-}

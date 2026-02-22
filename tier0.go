@@ -789,6 +789,7 @@ func handleResponse(messages *[]Message, auth *AuthMethod, userInput string, pre
 	trace := recorder.Commit()
 	if trace != nil {
 		irTrace := CompileIR(userInput, recorder.effects)
+		irTrace.RawTrigger = strings.ToLower(userInput)
 		jitEngine.Record(userInput, irTrace)
 	}
 
@@ -819,13 +820,6 @@ func handleResponse(messages *[]Message, auth *AuthMethod, userInput string, pre
 	}
 
 	return respStats, nil
-}
-
-func modeInstruction() string {
-	if currentMode == ModePlan {
-		return "Plan mode is active. Do not make edits, writes, or other mutating actions. Restrict yourself to read-only exploration and planning."
-	}
-	return "Build mode is active. Execute tasks directly. For implementation requests, your first response in a turn must perform concrete tool actions (for example reading relevant files, editing code, running checks) rather than only giving plans. Do not ask the user to choose a starting point when they already asked to proceed; only ask follow-up questions if truly blocked by missing required information. Keep discovery tight and non-redundant: gather minimal context, then edit."
 }
 
 func buildRuntimeContext() string {

@@ -911,56 +911,20 @@ func (ti *TraceIndex) Add(trigger string, signature string, ops []IRop) {
 	})
 }
 
-// Search finds the k nearest traces by embedding similarity.
-func (ti *TraceIndex) Search(embedding []float64, k int) []TraceIndexEntry {
-	if len(embedding) == 0 || len(ti.Entries) == 0 {
-		return nil
-	}
-
-	type scored struct {
-		entry TraceIndexEntry
-		score float64
-	}
-	var results []scored
-	for _, e := range ti.Entries {
-		if len(e.Embedding) == 0 {
-			continue
-		}
-		sim := cosineSimilarity(embedding, e.Embedding)
-		results = append(results, scored{entry: e, score: sim})
-	}
-
-	sort.Slice(results, func(i, j int) bool {
-		return results[i].score > results[j].score
-	})
-
-	var out []TraceIndexEntry
-	for i := 0; i < k && i < len(results); i++ {
-		out = append(out, results[i].entry)
-	}
-	return out
-}
-
-// FindMatch runs the AI-native cascade: embedding → RAG → intent → local LLM → API classifier.
+// FindMatch runs the matching cascade: embedding → local LLM fallback.
 // Stops at the first confident match (confidence >= 0.8).
-func (j *JIT) FindMatch(prompt string, auth *AuthMethod) *MatchResult {
+func (j *JIT) FindMatch(prompt string) *MatchResult {
+	// Embedding match
 	if ollamaAvailable() {
-		if result := j.matchByEmbedding(prompt); result != nil && result.Confidence >= 0.8 {
-			traceLog("[match] embedding hit: pattern=%s conf=%.2f", result.Pattern.ID, result.Confidence)
+		if result := j.embeddingMatch(prompt); result != nil && result.Confidence >= 0.8 {
+			traceLog("[match] embedding hit: pattern=%s conf=%.2f params=%v",
+				result.Pattern.ID, result.Confidence, result.Params)
 			return result
 		}
+		traceLog("[match] embedding: no confident match, falling back to cascade")
+	}
 
-		if result := j.matchByRAG(prompt); result != nil && result.Confidence >= 0.8 {
-			traceLog("[match] rag hit: pattern=%s conf=%.2f", result.Pattern.ID, result.Confidence)
-			return result
-		}
-
-		if result := j.matchByIntent(prompt); result != nil && result.Confidence >= 0.8 {
-			traceLog("[match] intent hit: pattern=%s conf=%.2f category=%s",
-				result.Pattern.ID, result.Confidence, result.Params["_category"])
-			return result
-		}
-
+	if ollamaAvailable() {
 		if result := j.matchByLocalLLM(prompt); result != nil && result.Confidence >= 0.8 {
 			traceLog("[match] local_llm hit: pattern=%s conf=%.2f params=%v",
 				result.Pattern.ID, result.Confidence, result.Params)
@@ -968,109 +932,8 @@ func (j *JIT) FindMatch(prompt string, auth *AuthMethod) *MatchResult {
 		}
 	}
 
-	if auth != nil {
-		if result := j.matchByAPIClassifier(prompt, auth); result != nil && result.Confidence >= 0.8 {
-			traceLog("[match] api_classifier hit: pattern=%s conf=%.2f params=%v",
-				result.Pattern.ID, result.Confidence, result.Params)
-			return result
-		}
-	}
-
 	traceLog("[match] no match found")
 	return &MatchResult{Strategy: "none", Confidence: 0}
-}
-
-// matchByEmbedding embeds the prompt and cosine-matches against all pattern embeddings.
-func (j *JIT) matchByEmbedding(prompt string) *MatchResult {
-	emb := ollamaEmbed(prompt)
-	if emb == nil {
-		return nil
-	}
-
-	var bestPattern *Pattern
-	bestSim := 0.0
-
-	for _, p := range j.Patterns.Patterns {
-		if len(p.Embedding) == 0 {
-			continue
-		}
-		sim := cosineSimilarity(emb, p.Embedding)
-		if sim > bestSim {
-			bestSim = sim
-			bestPattern = p
-		}
-	}
-
-	if bestPattern != nil {
-		traceLog("[match] embedding: best=%s sim=%.4f (threshold=0.70)", bestPattern.ID, bestSim)
-	}
-	if bestPattern == nil || bestSim < 0.70 {
-		return nil
-	}
-
-	confidence := 0.80 + (bestSim-0.70)*(0.20/0.30)
-	if confidence > 1.0 {
-		confidence = 1.0
-	}
-	return &MatchResult{
-		Pattern:    bestPattern,
-		Confidence: confidence,
-		Params:     make(map[string]string),
-		Strategy:   "embedding",
-	}
-}
-
-// matchByRAG embeds the prompt, finds k=3 nearest traces, and checks if they
-// share the same structural signature → use that signature's pattern.
-func (j *JIT) matchByRAG(prompt string) *MatchResult {
-	if j.TraceIndex == nil || len(j.TraceIndex.Entries) == 0 {
-		return nil
-	}
-
-	emb := ollamaEmbed(prompt)
-	if emb == nil {
-		return nil
-	}
-
-	nearest := j.TraceIndex.Search(emb, 3)
-	if len(nearest) == 0 {
-		return nil
-	}
-
-	var bestPattern *Pattern
-	bestOverlap := 0.0
-	matchCount := 0
-
-	for _, p := range j.Patterns.Patterns {
-		if p.Signature == nil {
-			continue
-		}
-		matches := 0
-		for _, entry := range nearest {
-			traceOps := predictedOpsFromSummary(entry.OpSummary)
-			traceSig := CanonicalSignature(traceOps)
-			if SignatureOverlap(p.Signature, traceSig) >= 0.7 {
-				matches++
-			}
-		}
-		overlap := float64(matches) / float64(len(nearest))
-		if overlap > bestOverlap {
-			bestOverlap = overlap
-			bestPattern = p
-			matchCount = matches
-		}
-	}
-
-	if matchCount < 2 || bestPattern == nil {
-		return nil
-	}
-
-	return &MatchResult{
-		Pattern:    bestPattern,
-		Confidence: bestOverlap,
-		Params:     make(map[string]string),
-		Strategy:   "rag",
-	}
 }
 
 // matchByLocalLLM sends a structured prompt to the local Ollama model for classification.
@@ -1118,43 +981,6 @@ Respond ONLY in JSON: {"pattern": "<pattern_id>", "confidence": 0.0-1.0, "params
 	return parseLLMClassification(resp, eligiblePatterns)
 }
 
-// matchByAPIClassifier uses a cheap Haiku call for classification.
-func (j *JIT) matchByAPIClassifier(prompt string, auth *AuthMethod) *MatchResult {
-	if len(j.Patterns.Patterns) == 0 || auth == nil {
-		return nil
-	}
-
-	var patternDescs strings.Builder
-	eligiblePatterns := make(map[string]*Pattern)
-	idx := 0
-	for _, p := range j.Patterns.Patterns {
-		idx++
-		eligiblePatterns[p.ID] = p
-		patternDescs.WriteString(fmt.Sprintf("%d. ID=%q keywords=[%s]\n", idx, p.ID, strings.Join(p.Keywords, ", ")))
-	}
-
-	if idx == 0 {
-		return nil
-	}
-
-	classifyPrompt := fmt.Sprintf(`Which pattern matches this request? Extract variable parameters.
-
-Request: %q
-
-Patterns:
-%s
-Respond ONLY in JSON: {"pattern": "<id>", "confidence": 0.0-1.0, "params": {"key": "value"}} or {"pattern": "none"}`,
-		prompt, patternDescs.String())
-
-	resp, err := classifierChat([]Message{{Role: "user", Content: classifyPrompt}}, auth)
-	if err != nil {
-		traceLog("[match] api_classifier error: %v", err)
-		return nil
-	}
-
-	return parseLLMClassification(resp, eligiblePatterns)
-}
-
 // parseLLMClassification parses JSON output from LLM classification (Strategy 3 & 4).
 func parseLLMClassification(resp string, patterns map[string]*Pattern) *MatchResult {
 	start := strings.Index(resp, "{")
@@ -1192,200 +1018,6 @@ func parseLLMClassification(resp string, patterns map[string]*Pattern) *MatchRes
 		Params:     result.Params,
 		Strategy:   "local_llm", // caller overrides for api_classifier
 	}
-}
-
-// predictedOpsFromSummary reconstructs minimal IRops from a trace index op summary.
-// e.g., "bash(grep -rn ollamaEmbed .), read_file(ollama.go)" → IRops
-func predictedOpsFromSummary(summary string) []IRop {
-	if summary == "" {
-		return nil
-	}
-	parts := strings.Split(summary, ", ")
-	var ops []IRop
-	for i, part := range parts {
-		tool := part
-		if idx := strings.Index(part, "("); idx > 0 {
-			tool = part[:idx]
-		}
-		kind := classifyToolKind(tool)
-		ops = append(ops, IRop{Index: i, Kind: kind, Tool: tool})
-	}
-	return ops
-}
-
-// classifyToolKind determines the OpKind for a tool name.
-func classifyToolKind(tool string) OpKind {
-	switch tool {
-	case "read_file", "read_files", "list_files", "grep", "find_symbol":
-		return OpRead
-	case "write_file", "write_files":
-		return OpWrite
-	case "bash":
-		return OpQuery // conservative: bash could be read or exec
-	default:
-		return OpExec
-	}
-}
-
-// predictedOpsToIROps converts PredictedOps back to IRops for signature computation.
-func predictedOpsToIROps(ops []PredictedOp) []IRop {
-	result := make([]IRop, len(ops))
-	for i, op := range ops {
-		argsJSON, _ := json.Marshal(op.StableArgs)
-		result[i] = IRop{
-			Index: i,
-			Kind:  op.Kind,
-			Tool:  op.Tool,
-			Args:  json.RawMessage(argsJSON),
-		}
-	}
-	return result
-}
-
-// matchByIntent classifies the prompt's intent via local LLM against known categories,
-// then verifies structural compatibility. Categories accumulate example prompts over time.
-func (j *JIT) matchByIntent(prompt string) *MatchResult {
-	if j.NeedTemplates == nil || len(j.NeedTemplates.IntentCategories) == 0 {
-		return nil
-	}
-
-	hintLabel := quickIntentHint(prompt)
-	var candidates []*IntentCategory
-	for _, cat := range j.NeedTemplates.IntentCategories {
-		if len(cat.PatternIDs) == 0 {
-			continue // skip seedless categories with no patterns
-		}
-		if strings.EqualFold(strings.TrimSpace(cat.Label), "general") {
-			continue
-		}
-		if hintLabel != "" && cat.Label == hintLabel {
-			candidates = append(candidates, cat)
-		} else if hintLabel == "" {
-			candidates = append(candidates, cat)
-		}
-	}
-	if len(candidates) == 0 {
-		for _, cat := range j.NeedTemplates.IntentCategories {
-			if len(cat.PatternIDs) > 0 && !strings.EqualFold(strings.TrimSpace(cat.Label), "general") {
-				candidates = append(candidates, cat)
-			}
-		}
-	}
-	if len(candidates) == 0 {
-		return nil
-	}
-
-	var catDescs strings.Builder
-	for i, cat := range candidates {
-		examples := cat.ExamplePrompts
-		if len(examples) > 5 {
-			examples = examples[:5]
-		}
-		catDescs.WriteString(fmt.Sprintf("%d. ID=%q label=%q examples=%v\n",
-			i+1, cat.ID, cat.Label, examples))
-	}
-
-	classifyPrompt := fmt.Sprintf(`Classify this user request into one of the intent categories below.
-
-Request: %q
-
-Categories:
-%s
-Respond ONLY in JSON: {"category": "<category_id>", "confidence": 0.0-1.0} or {"category": "none"}`,
-		prompt, catDescs.String())
-
-	resp := callOllama(classifyPrompt, 100)
-	if resp == "" {
-		return nil
-	}
-
-	start := strings.Index(resp, "{")
-	end := strings.LastIndex(resp, "}")
-	if start < 0 || end < 0 || end <= start {
-		return nil
-	}
-	var classification struct {
-		Category   string  `json:"category"`
-		Confidence float64 `json:"confidence"`
-	}
-	if json.Unmarshal([]byte(resp[start:end+1]), &classification) != nil {
-		return nil
-	}
-	if classification.Category == "none" || classification.Category == "" || classification.Confidence < 0.7 {
-		return nil
-	}
-
-	var matched *IntentCategory
-	for _, cat := range candidates {
-		if cat.ID == classification.Category {
-			matched = cat
-			break
-		}
-	}
-	if matched == nil {
-		return nil
-	}
-	if strings.EqualFold(strings.TrimSpace(matched.Label), "general") {
-		return nil
-	}
-
-	var bestPattern *Pattern
-	bestOverlap := 0.0
-	for _, pid := range matched.PatternIDs {
-		p := j.Patterns.FindByID(pid)
-		if p == nil || p.Signature == nil {
-			continue
-		}
-		overlap := SignatureOverlap(p.Signature, matched.CanonicalSig)
-		if overlap > bestOverlap {
-			bestOverlap = overlap
-			bestPattern = p
-		}
-	}
-	if bestPattern == nil {
-		return nil
-	}
-
-	finalConf := classification.Confidence * bestOverlap
-	if finalConf < 0.8 {
-		traceLog("[match] intent: category=%s conf=%.2f overlap=%.2f final=%.2f (below threshold)",
-			matched.ID, classification.Confidence, bestOverlap, finalConf)
-		return nil
-	}
-
-	return &MatchResult{
-		Pattern:    bestPattern,
-		Confidence: finalConf,
-		Params:     map[string]string{"_category": matched.ID, "_category_label": matched.Label},
-		Strategy:   "intent",
-	}
-}
-
-// quickIntentHint returns a likely intent label based on keyword rules.
-// Returns "" if no clear signal, letting the LLM consider all categories.
-func quickIntentHint(prompt string) string {
-	lower := strings.ToLower(prompt)
-
-	type rule struct {
-		keywords []string
-		label    string
-	}
-	rules := []rule{
-		{[]string{"explain", "walk me through", "how does", "what does", "describe"}, "explain_code"},
-		{[]string{"add test", "write test", "unit test", "add a test"}, "add_test"},
-		{[]string{"find ref", "find all", "where is", "who calls", "callers of"}, "find_refs"},
-		{[]string{"change", "update", "modify", "fix", "refactor"}, "modify_code"},
-		{[]string{"find and replace", "search and", "rename all", "replace all"}, "search_and_modify"},
-	}
-
-	for _, r := range rules {
-		for _, kw := range r.keywords {
-			if strings.Contains(lower, kw) {
-				return r.label
-			}
-		}
-	}
-	return ""
 }
 
 // NeedTemplate describes what information an intent requires.
@@ -1839,21 +1471,9 @@ func intersectWords(a, b []string) []string {
 	return result
 }
 
-// IntentCategory groups patterns by structural behavior, not prompt text.
-// Enables matching prompts that are semantically different but need the same tools.
-type IntentCategory struct {
-	ID             string         `json:"id"`              // e.g., "explain_code_abc12345"
-	Label          string         `json:"label"`           // "explain_code", "add_test", etc.
-	PatternIDs     []string       `json:"pattern_ids"`     // all Pattern IDs in this category
-	CanonicalSig   map[string]int `json:"canonical_sig"`   // merged structural signature
-	ExamplePrompts []string       `json:"example_prompts"` // up to 20, for LLM context
-	SeenCount      int            `json:"seen_count"`
-}
-
 // NeedTemplateStore manages learned need templates.
 type NeedTemplateStore struct {
-	Templates        []*NeedTemplate   `json:"templates"`
-	IntentCategories []*IntentCategory `json:"intent_categories,omitempty"`
+	Templates []*NeedTemplate `json:"templates"`
 }
 
 func LoadNeedTemplates() *NeedTemplateStore {
@@ -1971,123 +1591,7 @@ func inferIntent(needs []InfoNeed, actions []string) string {
 	}
 }
 
-// LearnIntentCategory creates or updates an IntentCategory from a completed trace.
-// Called after LearnFromTrace with the matched NeedTemplate and trace signature.
-func (ns *NeedTemplateStore) LearnIntentCategory(tmpl *NeedTemplate, sig map[string]int, prompt string) {
-	if tmpl == nil || tmpl.Intent == "" {
-		return
-	}
 
-	for _, cat := range ns.IntentCategories {
-		if cat.Label != tmpl.Intent {
-			continue
-		}
-		if SignatureOverlap(sig, cat.CanonicalSig) < 0.6 {
-			continue
-		}
-		if !containsStr(cat.PatternIDs, tmpl.ID) {
-			cat.PatternIDs = append(cat.PatternIDs, tmpl.ID)
-		}
-		cat.CanonicalSig = mergeSigs(cat.CanonicalSig, sig, cat.SeenCount)
-		cat.ExamplePrompts = appendCapped(cat.ExamplePrompts, prompt, 20)
-		cat.SeenCount++
-		traceLog("[intent] updated category %s (patterns=%d, examples=%d, seen=%d)",
-			cat.ID, len(cat.PatternIDs), len(cat.ExamplePrompts), cat.SeenCount)
-		return
-	}
-
-	_, trigID := normalizeTrigger(prompt)
-	catID := tmpl.Intent + "_" + trigID[:8]
-	ns.IntentCategories = append(ns.IntentCategories, &IntentCategory{
-		ID:             catID,
-		Label:          tmpl.Intent,
-		PatternIDs:     []string{tmpl.ID},
-		CanonicalSig:   copySig(sig),
-		ExamplePrompts: []string{prompt},
-		SeenCount:      1,
-	})
-	traceLog("[intent] new category %s label=%q", catID, tmpl.Intent)
-}
-
-// EnsureIntentSeeds pre-populates known intent labels on first load.
-func (ns *NeedTemplateStore) EnsureIntentSeeds() {
-	if len(ns.IntentCategories) > 0 {
-		return // already seeded
-	}
-	seeds := []struct {
-		label    string
-		examples []string
-	}{
-		{"run_checks", []string{"run tests", "run go test", "execute test suite"}},
-		{"explain_code", []string{"explain how this works", "walk me through this code"}},
-		{"add_test", []string{"add tests for this function", "write unit tests"}},
-		{"find_refs", []string{"find all references to this", "where is this used"}},
-		{"modify_code", []string{"change this function to", "update the implementation"}},
-		{"search_and_modify", []string{"find and replace all usages", "refactor all callers"}},
-		{"general", []string{"help me with this", "what should I do here"}},
-	}
-	for _, s := range seeds {
-		ns.IntentCategories = append(ns.IntentCategories, &IntentCategory{
-			ID:             s.label + "_seed",
-			Label:          s.label,
-			PatternIDs:     nil,
-			CanonicalSig:   make(map[string]int),
-			ExamplePrompts: s.examples,
-			SeenCount:      0,
-		})
-	}
-	traceLog("[intent] seeded %d intent categories", len(seeds))
-}
-
-// mergeSigs merges a new signature into an existing one via running average.
-func mergeSigs(existing, new_ map[string]int, count int) map[string]int {
-	result := make(map[string]int, len(existing)+len(new_))
-	for k, v := range existing {
-		result[k] = v
-	}
-	n := count + 1
-	for k, v := range new_ {
-		if ev, ok := result[k]; ok {
-			result[k] = (ev*(n-1) + v) / n
-		} else {
-			result[k] = v / n
-		}
-	}
-	return result
-}
-
-// copySig returns a copy of a signature map.
-func copySig(sig map[string]int) map[string]int {
-	result := make(map[string]int, len(sig))
-	for k, v := range sig {
-		result[k] = v
-	}
-	return result
-}
-
-// appendCapped appends s to the slice, capping at maxLen by dropping the oldest.
-func appendCapped(slice []string, s string, maxLen int) []string {
-	for _, existing := range slice {
-		if existing == s {
-			return slice
-		}
-	}
-	slice = append(slice, s)
-	if len(slice) > maxLen {
-		slice = slice[len(slice)-maxLen:]
-	}
-	return slice
-}
-
-// containsStr checks if a string slice contains a value.
-func containsStr(slice []string, s string) bool {
-	for _, v := range slice {
-		if v == s {
-			return true
-		}
-	}
-	return false
-}
 
 // classifyNeed determines what kind of information a read/query op was fetching,
 // by examining the op itself and the context of earlier ops in the trace.
@@ -2329,8 +1833,10 @@ type Pattern struct {
 	Occurrences int            `json:"occurrences"` // times seen
 	Successes   int            `json:"successes"`   // times speculation helped
 	LastUsed    time.Time      `json:"last_used"`
-	Embedding   []float64      `json:"embedding,omitempty"` // averaged trigger embedding
+	Embedding   []float64      `json:"embedding,omitempty"` // embedding of Description
 	Signature   map[string]int `json:"signature,omitempty"` // canonical structural signature
+	Triggers    []string       `json:"triggers,omitempty"`  // raw user prompts that matched this pattern
+	Description string         `json:"description,omitempty"` // rich text for embedding (auto-built)
 }
 
 // PredictedOp is one predicted tool call with argument stability tracking.
@@ -2518,9 +2024,10 @@ func (ps *PatternStore) LearnPattern(trace *IRTrace) {
 	keywords := strings.Fields(strings.ToLower(trace.Trigger))
 	newSig := CanonicalSignature(trace.Ops)
 
-	var newEmb []float64
-	if ollamaAvailable() {
-		newEmb = ollamaEmbed(trace.Trigger)
+	// Use raw trigger for accumulation; fall back to normalized
+	rawTrigger := trace.RawTrigger
+	if rawTrigger == "" {
+		rawTrigger = trace.Trigger
 	}
 
 	for _, p := range ps.Patterns {
@@ -2529,8 +2036,10 @@ func (ps *PatternStore) LearnPattern(trace *IRTrace) {
 		}
 		sigOverlap := SignatureOverlap(newSig, p.Signature)
 		embSim := 0.0
-		if newEmb != nil && len(p.Embedding) > 0 {
-			embSim = cosineSimilarity(newEmb, p.Embedding)
+		if len(p.Embedding) > 0 {
+			if newEmb := ollamaEmbed(trace.Trigger); newEmb != nil {
+				embSim = cosineSimilarity(newEmb, p.Embedding)
+			}
 		}
 		if sigOverlap >= 0.8 || embSim >= 0.80 {
 			p.Occurrences++
@@ -2544,9 +2053,9 @@ func (ps *PatternStore) LearnPattern(trace *IRTrace) {
 					p.Keywords = append(p.Keywords, k)
 				}
 			}
-			if newEmb != nil && len(newEmb) > 0 {
-				p.Embedding = mergeEmbeddings(p.Embedding, newEmb, p.Occurrences)
-			}
+			p.addTrigger(rawTrigger)
+			p.rebuildDescription()
+			p.reembed()
 			p.mergeOps(trace.Ops)
 			traceLog("[jit] merged into pattern %s (sig=%.2f, emb=%.2f, occ=%d)", p.ID, sigOverlap, embSim, p.Occurrences)
 			return
@@ -2568,17 +2077,98 @@ func (ps *PatternStore) LearnPattern(trace *IRTrace) {
 	}
 
 	_, triggerID := normalizeTrigger(trace.Trigger)
-	ps.Patterns = append(ps.Patterns, &Pattern{
+	p := &Pattern{
 		ID:          triggerID[:16],
 		Keywords:    keywords,
 		Ops:         ops,
 		Occurrences: 1,
 		Successes:   0,
 		LastUsed:    time.Now(),
-		Embedding:   newEmb,
 		Signature:   newSig,
-	})
+		Triggers:    []string{rawTrigger},
+	}
+	p.rebuildDescription()
+	p.reembed()
+	ps.Patterns = append(ps.Patterns, p)
 	traceLog("[jit] new pattern %s (%d ops)", triggerID[:16], len(ops))
+}
+
+// addTrigger appends a raw user prompt to the pattern's trigger history.
+// Deduplicates and caps at 50 triggers to bound description size.
+func (p *Pattern) addTrigger(raw string) {
+	raw = strings.TrimSpace(raw)
+	if raw == "" {
+		return
+	}
+	for _, t := range p.Triggers {
+		if t == raw {
+			return
+		}
+	}
+	p.Triggers = append(p.Triggers, raw)
+	if len(p.Triggers) > 50 {
+		p.Triggers = p.Triggers[len(p.Triggers)-50:]
+	}
+}
+
+// rebuildDescription builds a rich text block from triggers, keywords, and
+// stable args. This text is what gets embedded for semantic matching.
+func (p *Pattern) rebuildDescription() {
+	var b strings.Builder
+
+	// Past user prompts — the richest signal
+	if len(p.Triggers) > 0 {
+		b.WriteString("User requests: ")
+		b.WriteString(strings.Join(p.Triggers, " | "))
+		b.WriteString("\n")
+	}
+
+	// Keywords
+	if len(p.Keywords) > 0 {
+		b.WriteString("Keywords: ")
+		b.WriteString(strings.Join(p.Keywords, ", "))
+		b.WriteString("\n")
+	}
+
+	// Tool operations with stable args
+	for _, op := range p.Ops {
+		b.WriteString(fmt.Sprintf("Op: %s:%s", op.Kind, op.Tool))
+		if len(op.StableArgs) > 0 {
+			args := make([]string, 0, len(op.StableArgs))
+			for k, v := range op.StableArgs {
+				// Skip large values (e.g. file contents) — keep arg names + short values
+				if len(v) > 100 {
+					args = append(args, k+"=<...>")
+				} else {
+					args = append(args, k+"="+v)
+				}
+			}
+			b.WriteString(" [")
+			b.WriteString(strings.Join(args, ", "))
+			b.WriteString("]")
+		}
+		b.WriteString("\n")
+	}
+
+	p.Description = b.String()
+}
+
+// reembed updates the pattern's embedding from its Description using Ollama.
+// Truncates to ~6000 chars to stay within nomic-embed-text's 2048 token window.
+func (p *Pattern) reembed() {
+	if !ollamaAvailable() {
+		return
+	}
+	text := p.Description
+	if text == "" {
+		text = strings.Join(p.Keywords, " ")
+	}
+	if len(text) > 6000 {
+		text = text[:6000]
+	}
+	if emb := ollamaEmbed(text); emb != nil {
+		p.Embedding = emb
+	}
 }
 
 // mergeOps tracks argument stability across traces.
@@ -2652,22 +2242,6 @@ func extractArgs(raw json.RawMessage) map[string]string {
 			b, _ := json.Marshal(v)
 			result[k] = string(b)
 		}
-	}
-	return result
-}
-
-// mergeEmbeddings computes a running average of embeddings.
-func mergeEmbeddings(existing, new_ []float64, count int) []float64 {
-	if len(existing) == 0 {
-		return new_
-	}
-	if len(existing) != len(new_) {
-		return new_
-	}
-	result := make([]float64, len(existing))
-	n := float64(count)
-	for i := range existing {
-		result[i] = existing[i]*((n-1)/n) + new_[i]*(1/n)
 	}
 	return result
 }
@@ -3439,13 +3013,6 @@ func lexicalCommandFit(prompt, command string) (bool, float64) {
 	}
 	ratio := overlap / float64(len(ct))
 	return ratio >= 0.3, clamp01(ratio)
-}
-
-func inferExclusiveFromIntentPrototypes(prompt string) (bool, bool) {
-	if ex, conf, ok := predictExclusiveLogReg(prompt); ok && conf >= 0.6 {
-		return ex, true
-	}
-	return false, false
 }
 
 func trainIntentModelFromClaude(claudeDir string, maxSamples int) (*IntentLogRegModel, error) {

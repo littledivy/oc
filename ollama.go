@@ -37,7 +37,7 @@ func ollamaEmbedModel() string {
 	if m := os.Getenv("OLLAMA_EMBED_MODEL"); m != "" {
 		return m
 	}
-	return "nomic-embed-text"
+	return "bge-large"
 }
 
 // ollamaAvailable checks if Ollama is reachable (cached after first check).
@@ -69,39 +69,6 @@ func callOllama(prompt string, maxTokens int) string {
 			"temperature": 0.1,
 			"top_p":       0.9,
 			"stop":        []string{"\n"},
-		},
-	})
-	client := &http.Client{Timeout: 30 * time.Second}
-	resp, err := client.Post(ollamaHost()+"/api/generate", "application/json", bytes.NewReader(body))
-	if err != nil {
-		return ""
-	}
-	defer resp.Body.Close()
-	data, err := io.ReadAll(resp.Body)
-	if err != nil {
-		return ""
-	}
-	var result struct {
-		Response string `json:"response"`
-	}
-	if json.Unmarshal(data, &result) != nil {
-		return ""
-	}
-	return strings.TrimSpace(result.Response)
-}
-
-// callOllamaDeterministic is for short classification tasks where output
-// stability matters more than creativity.
-func callOllamaDeterministic(prompt string, maxTokens int) string {
-	body, _ := json.Marshal(map[string]any{
-		"model":  ollamaModel(),
-		"prompt": prompt,
-		"stream": false,
-		"options": map[string]any{
-			"num_predict": maxTokens,
-			"temperature": 0.0,
-			"top_p":       1.0,
-			"seed":        1,
 		},
 	})
 	client := &http.Client{Timeout: 30 * time.Second}

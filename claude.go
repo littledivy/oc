@@ -28,7 +28,7 @@ const (
 	apiVersion       = "2023-06-01"
 )
 
-// Global callback token accumulators — updated by classifierChat calls.
+// Global callback token accumulators.
 var (
 	callbackInputTokens  int
 	callbackOutputTokens int
@@ -244,85 +244,6 @@ func parseSSEData(data string) *StreamEvent {
 	return &StreamEvent{Type: "other"}
 }
 
-const classifierModel = "claude-haiku-4-5-20251001"
-
-// classifierChat makes a non-streaming API call using Haiku for cheap classification.
-// Used as a fallback when Ollama is unavailable.
-func classifierChat(messages []Message, auth *AuthMethod) (string, error) {
-	stopSpinner := startSpinner(nil)
-	defer stopSpinner()
-
-	if auth != nil && auth.IsOpenAI() {
-		return classifierChatOpenAI(messages, auth)
-	}
-
-	reqBody := map[string]any{
-		"model":       classifierModel,
-		"max_tokens":  256,
-		"temperature": 0.0,
-		"stream":      false,
-		"messages":    messages,
-	}
-	data, _ := json.Marshal(reqBody)
-
-	url := fmt.Sprintf("https://%s/v1/messages", anthropicAPIHost)
-	if auth.IsOAuth() {
-		url += "?beta=true"
-	}
-
-	req, err := http.NewRequest("POST", url, bytes.NewReader(data))
-	if err != nil {
-		return "", err
-	}
-
-	req.Header.Set("Content-Type", "application/json")
-	req.Header.Set("anthropic-version", apiVersion)
-
-	if auth.IsOAuth() {
-		req.Header.Set("Authorization", "Bearer "+auth.Token.AccessToken)
-		req.Header.Set("anthropic-beta", "oauth-2025-04-20,interleaved-thinking-2025-05-14")
-	} else {
-		req.Header.Set("x-api-key", auth.APIKey)
-	}
-
-	resp, err := http.DefaultClient.Do(req)
-	if err != nil {
-		return "", err
-	}
-	defer resp.Body.Close()
-
-	body, _ := io.ReadAll(resp.Body)
-	if resp.StatusCode != 200 {
-		return "", fmt.Errorf("API error %d: %s", resp.StatusCode, string(body))
-	}
-
-	var result struct {
-		Content []struct {
-			Type string `json:"type"`
-			Text string `json:"text"`
-		} `json:"content"`
-		Usage struct {
-			InputTokens  int `json:"input_tokens"`
-			OutputTokens int `json:"output_tokens"`
-		} `json:"usage"`
-	}
-	if err := json.Unmarshal(body, &result); err != nil {
-		return "", fmt.Errorf("failed to parse response: %v", err)
-	}
-
-	callbackInputTokens += result.Usage.InputTokens
-	callbackOutputTokens += result.Usage.OutputTokens
-	callbackAPICalls++
-
-	var texts []string
-	for _, block := range result.Content {
-		if block.Type == "text" {
-			texts = append(texts, block.Text)
-		}
-	}
-	return strings.Join(texts, "\n"), nil
-}
-
 func compactionChat(messages []Message, auth *AuthMethod, sysPrompt string) (string, error) {
 	if auth != nil && auth.IsOpenAI() {
 		return compactionChatOpenAI(messages, auth, sysPrompt)
@@ -530,6 +451,10 @@ func getAuth() (*AuthMethod, error) {
 		return getAnthropicAuth()
 	}
 
+	if auth, err := getAnthropicAuth(); err == nil && auth != nil {
+		return auth, nil
+	}
+
 	if key := strings.TrimSpace(os.Getenv("OPENAI_API_KEY")); key != "" {
 		return &AuthMethod{Provider: "openai", APIKey: key}, nil
 	}
@@ -537,7 +462,7 @@ func getAuth() (*AuthMethod, error) {
 		return auth, nil
 	}
 
-	return getAnthropicAuth()
+	return nil, nil
 }
 
 func getSavedOpenAIAuth() (*AuthMethod, error) {

@@ -76,32 +76,6 @@ func TestExtractArgsInvalid(t *testing.T) {
 	}
 }
 
-func TestMergeEmbeddings(t *testing.T) {
-	a := []float64{1.0, 0.0, 0.5}
-	b := []float64{0.0, 1.0, 0.5}
-	result := mergeEmbeddings(a, b, 2)
-	if len(result) != 3 {
-		t.Fatalf("expected len 3, got %d", len(result))
-	}
-	if result[0] != 0.5 {
-		t.Errorf("expected 0.5, got %f", result[0])
-	}
-	if result[1] != 0.5 {
-		t.Errorf("expected 0.5, got %f", result[1])
-	}
-	if result[2] != 0.5 {
-		t.Errorf("expected 0.5, got %f", result[2])
-	}
-}
-
-func TestMergeEmbeddingsEmpty(t *testing.T) {
-	b := []float64{1.0, 2.0}
-	result := mergeEmbeddings(nil, b, 1)
-	if len(result) != 2 || result[0] != 1.0 {
-		t.Errorf("expected b returned when existing is nil, got %v", result)
-	}
-}
-
 func TestArgStabilityTracking(t *testing.T) {
 	ps := &PatternStore{}
 
@@ -228,40 +202,6 @@ func TestParseLLMClassification(t *testing.T) {
 	}
 }
 
-func TestTraceIndexSearchEmpty(t *testing.T) {
-	ti := &TraceIndex{}
-	results := ti.Search([]float64{1, 0, 0}, 3)
-	if len(results) != 0 {
-		t.Errorf("expected 0 results from empty index, got %d", len(results))
-	}
-
-	results = ti.Search(nil, 3)
-	if len(results) != 0 {
-		t.Errorf("expected 0 results for nil embedding, got %d", len(results))
-	}
-}
-
-func TestTraceIndexSearch(t *testing.T) {
-	ti := &TraceIndex{
-		Entries: []TraceIndexEntry{
-			{TriggerID: "a", Trigger: "add test subtract", Signature: "sig1", Embedding: []float64{0.9, 0.1, 0.0}},
-			{TriggerID: "b", Trigger: "fix bug login", Signature: "sig2", Embedding: []float64{0.1, 0.9, 0.0}},
-			{TriggerID: "c", Trigger: "add test multiply", Signature: "sig1", Embedding: []float64{0.85, 0.15, 0.0}},
-		},
-	}
-
-	results := ti.Search([]float64{1.0, 0.0, 0.0}, 2)
-	if len(results) != 2 {
-		t.Fatalf("expected 2 results, got %d", len(results))
-	}
-	if results[0].TriggerID != "a" {
-		t.Errorf("expected nearest to be 'a', got %s", results[0].TriggerID)
-	}
-	if results[1].TriggerID != "c" {
-		t.Errorf("expected second nearest to be 'c', got %s", results[1].TriggerID)
-	}
-}
-
 func TestTraceIndexAddNoDuplicate(t *testing.T) {
 	ti := &TraceIndex{}
 	ti.Add("add test subtract", "sig1", []IRop{{Tool: "read_file", Args: json.RawMessage(`{"path":"calc.go"}`)}})
@@ -271,19 +211,3 @@ func TestTraceIndexAddNoDuplicate(t *testing.T) {
 	}
 }
 
-func TestPredictedOpsToIROps(t *testing.T) {
-	ops := []PredictedOp{
-		{Tool: "read_file", Kind: OpRead, StableArgs: map[string]string{"path": "calc.go"}},
-		{Tool: "bash", Kind: OpAssert, StableArgs: map[string]string{"command": "go test"}},
-	}
-	irOps := predictedOpsToIROps(ops)
-	if len(irOps) != 2 {
-		t.Fatalf("expected 2 ops, got %d", len(irOps))
-	}
-	if irOps[0].Tool != "read_file" || irOps[0].Kind != OpRead {
-		t.Errorf("unexpected first op: %v", irOps[0])
-	}
-	if irOps[1].Tool != "bash" || irOps[1].Kind != OpAssert {
-		t.Errorf("unexpected second op: %v", irOps[1])
-	}
-}

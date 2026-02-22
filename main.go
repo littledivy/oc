@@ -962,22 +962,12 @@ func termWidth() int {
 }
 
 func extToLang(path string) string {
-	ext := strings.TrimPrefix(filepath.Ext(path), ".")
-	switch ext {
-	case "go":
-		return "go"
-	case "py":
-		return "python"
-	case "js":
-		return "javascript"
-	case "ts":
-		return "typescript"
-	case "rs":
-		return "rust"
-	case "rb":
-		return "ruby"
-	case "sh", "bash", "zsh":
-		return "bash"
+	ext := filepath.Ext(path)
+	if lang := langFromExt(ext); lang != "" {
+		return lang
+	}
+	e := strings.TrimPrefix(ext, ".")
+	switch e {
 	case "yml", "yaml":
 		return "yaml"
 	case "md":
@@ -985,7 +975,7 @@ func extToLang(path string) string {
 	case "":
 		return ""
 	default:
-		return ext
+		return e
 	}
 }
 
@@ -1119,8 +1109,3 @@ func langFromExt(ext string) string {
 	}
 }
 
-// fileExists checks whether a path exists.
-func fileExists(path string) bool {
-	_, err := os.Stat(path)
-	return err == nil
-}

@@ -210,38 +210,26 @@ var toolDefinitions = `[
   },
   {
     "name": "code",
-    "description": "Execute TypeScript code with access to oc filesystem, shell, and LLM APIs. Use this for complex multi-file operations that would otherwise require many sequential tool calls. The code runs via Deno with oc.* bindings: oc.read(path), oc.write(path, content), oc.edit(path, old, new), oc.glob(pattern), oc.grep(pattern, path?), oc.bash(cmd), oc.list(path?), oc.ask(prompt) - call the LLM for reasoning/analysis. Use console.log() for output. Example: const files = await oc.glob('**/*.go'); for (const f of files) { const c = await oc.read(f); if (c.includes('TODO')) console.log(f); }",
+    "description": "Execute TypeScript code and save it as a reusable skill. The code runs via Deno with oc.* bindings: oc.read(path), oc.write(path, content), oc.edit(path, old, new), oc.glob(pattern), oc.grep(pattern, path?), oc.bash(cmd), oc.list(path?), oc.ask(prompt). Use console.log() for output.",
     "input_schema": {
       "type": "object",
       "properties": {
-        "code": {"type": "string", "description": "TypeScript code to execute. Has access to oc.* APIs including oc.ask() for LLM calls."}
+        "code": {"type": "string", "description": "TypeScript code to execute"},
+        "skill_name": {"type": "string", "description": "Short unique name for this skill, e.g. find_todos, run_tests, add_endpoint"},
+        "skill_description": {"type": "string", "description": "What this code does, e.g. 'Find all TODO comments in Go files'"}
       },
-      "required": ["code"]
+      "required": ["code", "skill_name", "skill_description"]
     }
   },
   {
     "name": "run_skill",
-    "description": "Execute a saved code skill by name. Code skills are reusable TypeScript snippets. Check context for available skills matching your task.",
+    "description": "Execute a saved code skill by name.",
     "input_schema": {
       "type": "object",
       "properties": {
         "name": {"type": "string", "description": "Name of the skill to run"}
       },
       "required": ["name"]
-    }
-  },
-  {
-    "name": "save_skill",
-    "description": "Save a TypeScript code snippet as a reusable skill for future use. The skill can be invoked later via run_skill.",
-    "input_schema": {
-      "type": "object",
-      "properties": {
-        "name": {"type": "string", "description": "Short unique name for the skill, e.g. find_todos"},
-        "description": {"type": "string", "description": "Brief description of what the skill does"},
-        "keywords": {"type": "string", "description": "Space-separated keywords for matching, e.g. 'todo find search comment'"},
-        "code": {"type": "string", "description": "TypeScript code to save"}
-      },
-      "required": ["name", "description", "code"]
     }
   }
 ]`
@@ -286,8 +274,21 @@ func buildRunSkillDescription() string {
 	return b.String()
 }
 
+// codeToolOnly filters out tools that the code tool subsumes, forcing the LLM
+// to use the code tool for file I/O instead of sequential read/write/list calls.
+var codeToolOnly = map[string]bool{
+	"read_file":  true,
+	"read_files": true,
+	"write_file": true,
+	"write_files": true,
+	"list_files":  true,
+	"save_skill": true,
+}
+
 // buildToolDefinitions returns tool definitions JSON with dynamic skill list
 // embedded in the run_skill description so the LLM sees available skills upfront.
+// Tools in codeToolOnly are hidden from the LLM but still executable via dispatch
+// (edit_file, bash, grep etc. remain available directly).
 func buildToolDefinitions() string {
 	desc := buildRunSkillDescription()
 
@@ -296,14 +297,19 @@ func buildToolDefinitions() string {
 		return toolDefinitions
 	}
 
+	filtered := tools[:0]
 	for i := range tools {
-		if name, _ := tools[i]["name"].(string); name == "run_skill" {
-			tools[i]["description"] = desc
-			break
+		name, _ := tools[i]["name"].(string)
+		if codeToolOnly[name] {
+			continue
 		}
+		if name == "run_skill" {
+			tools[i]["description"] = desc
+		}
+		filtered = append(filtered, tools[i])
 	}
 
-	out, err := json.Marshal(tools)
+	out, err := json.Marshal(filtered)
 	if err != nil {
 		return toolDefinitions
 	}
@@ -367,11 +373,13 @@ func executeTool(name string, inputJSON json.RawMessage) ToolResult {
 	case "regex_edit":
 		return execRegexEdit(input["pattern"], input["replacement"], input["glob"], input["dry_run"])
 	case "code":
-		return execCode(input["code"])
+		result := execCode(input["code"])
+		if !result.IsError && input["skill_name"] != "" {
+			execSaveSkill(input["skill_name"], input["skill_description"], "", input["code"])
+		}
+		return result
 	case "run_skill":
 		return execRunSkill(input["name"])
-	case "save_skill":
-		return execSaveSkill(input["name"], input["description"], input["keywords"], input["code"])
 	default:
 		return ToolResult{Content: fmt.Sprintf("Unknown tool: %s", name), IsError: true}
 	}
@@ -885,7 +893,32 @@ func truncateToolOutput(tool, out string) string {
 
 // execBashClean runs a command and captures output without terminal display interference.
 // Full output is available via Ctrl+O, with a simple summary shown after completion.
+// bashFileIOPattern matches bash commands that read/write files directly.
+// These should go through the code tool instead.
+var bashFileIOCommands = []string{"cat ", "head ", "tail ", "less ", "more ", "tee ", "cp ", "mv ", "ls ", "ls\n", "find "}
+
+func isBashFileIO(command string) bool {
+	cmd := strings.TrimSpace(command)
+	for _, prefix := range bashFileIOCommands {
+		if strings.HasPrefix(cmd, prefix) || strings.HasPrefix(cmd, "sudo "+prefix) {
+			return true
+		}
+	}
+	// Also catch redirections used for writing: echo/printf > file
+	if (strings.HasPrefix(cmd, "echo ") || strings.HasPrefix(cmd, "printf ")) &&
+		(strings.Contains(cmd, " > ") || strings.Contains(cmd, " >> ")) {
+		return true
+	}
+	return false
+}
+
 func execBashClean(command string) ToolResult {
+	if isBashFileIO(command) {
+		return ToolResult{
+			Content: "Use the code tool for file operations. bash is for build/test/git/runtime commands. Example: code tool with oc.read(), oc.write(), oc.list().",
+			IsError: true,
+		}
+	}
 	timeoutSec := 45
 	if raw := strings.TrimSpace(os.Getenv("OC_BASH_TIMEOUT_SEC")); raw != "" {
 		if n, err := strconv.Atoi(raw); err == nil && n > 0 {
@@ -1594,49 +1627,6 @@ func parseErrorLine(line, language string) *CompilerError {
 	return nil
 }
 
-// EnrichBuildErrors takes a failed auto-build result, parses the errors,
-// reads source context around each error location, and returns an enriched
-// hint string. This eliminates the read_file round-trip the LLM would
-// normally need to see the error context.
-func EnrichBuildErrors(buildResult *AutoBuildResult, language string) string {
-	if buildResult == nil || !buildResult.IsError {
-		return ""
-	}
-
-	errors := ParseCompilerErrors(buildResult.Output, language)
-	if len(errors) == 0 {
-		return ""
-	}
-
-	var b strings.Builder
-	b.WriteString("\n--- error context (auto-fetched) ---\n")
-
-	cwd, _ := os.Getwd()
-
-	for i, ce := range errors {
-		if i > 0 {
-			b.WriteString("\n")
-		}
-
-		path := ce.File
-		if !filepath.IsAbs(path) {
-			path = filepath.Join(cwd, path)
-		}
-
-		b.WriteString(fmt.Sprintf("[%d] %s:%d", i+1, ce.File, ce.Line))
-		if ce.Message != "" {
-			b.WriteString(fmt.Sprintf(" — %s", ce.Message))
-		}
-		b.WriteString("\n")
-
-		snippet := readSourceContext(path, ce.Line, 5)
-		if snippet != "" {
-			b.WriteString(snippet)
-		}
-	}
-
-	return b.String()
-}
 
 // readSourceContext reads lines around the target line from a file.
 // Returns numbered lines with the error line marked.

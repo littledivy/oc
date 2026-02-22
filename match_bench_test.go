@@ -48,16 +48,6 @@ func makePattern(id int, nOps int, embDim int) *Pattern {
 	}
 }
 
-func makeTraceIndexEntry(id int, sig string, embDim int) TraceIndexEntry {
-	return TraceIndexEntry{
-		TriggerID: fmt.Sprintf("trig_%d", id),
-		Trigger:   fmt.Sprintf("add test for function_%d", id),
-		Signature: sig,
-		Embedding: makeEmbedding(id+1000, embDim),
-		OpSummary: fmt.Sprintf("read_file(f%d.go), write_file(f%d_test.go)", id, id),
-	}
-}
-
 func BenchmarkCanonicalSignature(b *testing.B) {
 	for _, nOps := range []int{4, 10, 50} {
 		ops := make([]IRop, nOps)
@@ -123,33 +113,6 @@ func BenchmarkExtractArgs(b *testing.B) {
 			extractArgs(large)
 		}
 	})
-}
-
-func BenchmarkMergeEmbeddings(b *testing.B) {
-	for _, dim := range []int{384, 768, 1536} {
-		a := makeEmbedding(1, dim)
-		bv := makeEmbedding(2, dim)
-		b.Run(fmt.Sprintf("dim=%d", dim), func(b *testing.B) {
-			for i := 0; i < b.N; i++ {
-				mergeEmbeddings(a, bv, 5)
-			}
-		})
-	}
-}
-
-func BenchmarkTraceIndexSearch(b *testing.B) {
-	for _, nEntries := range []int{10, 50, 200, 1000} {
-		ti := &TraceIndex{}
-		for i := 0; i < nEntries; i++ {
-			ti.Entries = append(ti.Entries, makeTraceIndexEntry(i, "sig1", 384))
-		}
-		query := makeEmbedding(9999, 384)
-		b.Run(fmt.Sprintf("entries=%d", nEntries), func(b *testing.B) {
-			for i := 0; i < b.N; i++ {
-				ti.Search(query, 3)
-			}
-		})
-	}
 }
 
 func BenchmarkMatchByEmbedding(b *testing.B) {

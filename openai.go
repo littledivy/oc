@@ -81,83 +81,6 @@ func streamChatOpenAI(messages []Message, auth *AuthMethod, systemPrompt string)
 	return &StreamReader{events: events}, nil
 }
 
-func classifierChatOpenAI(messages []Message, auth *AuthMethod) (string, error) {
-	reqBody := map[string]any{
-		"model":       openAIModelName(),
-		"max_tokens":  256,
-		"temperature": 0,
-		"messages":    buildOpenAIMessages(messages, ""),
-	}
-	if auth != nil && auth.Token != nil {
-		reqBody = map[string]any{
-			"model":        openAIModelName(),
-			"instructions": "You are a strict JSON intent classifier. Return only JSON.",
-			"stream":       true,
-			"store":        false,
-			"input":        buildOpenAIResponsesInput(messages, ""),
-		}
-	}
-	data, _ := json.Marshal(reqBody)
-
-	url := fmt.Sprintf("https://%s/v1/chat/completions", openAIAPIHost)
-	if auth != nil && auth.Token != nil {
-		url = fmt.Sprintf("https://%s/backend-api/codex/responses", openAICodexHost)
-	}
-	req, err := http.NewRequest("POST", url, bytes.NewReader(data))
-	if err != nil {
-		return "", err
-	}
-	req.Header.Set("Content-Type", "application/json")
-	credential, accountID, err := ensureOpenAIToken(auth)
-	if err != nil {
-		return "", err
-	}
-	req.Header.Set("Authorization", "Bearer "+credential)
-	if accountID != "" {
-		req.Header.Set("ChatGPT-Account-Id", accountID)
-	}
-	req.Header.Set("originator", "oc")
-	req.Header.Set("User-Agent", "oc")
-
-	resp, err := http.DefaultClient.Do(req)
-	if err != nil {
-		return "", err
-	}
-	defer resp.Body.Close()
-
-	body, _ := io.ReadAll(resp.Body)
-	if resp.StatusCode != 200 {
-		return "", fmt.Errorf("OpenAI API error %d: %s", resp.StatusCode, string(body))
-	}
-	var events []StreamEvent
-	if auth != nil && auth.Token != nil {
-		events = parseOpenAIResponsesSSEBody(body)
-	} else {
-		var err error
-		events, err = parseOpenAIEvents(body)
-		if err != nil {
-			return "", err
-		}
-	}
-	var text strings.Builder
-	var in, out int
-	for _, ev := range events {
-		if ev.Type == "usage" {
-			in += ev.InputTokens
-		}
-		if ev.Type == "message_delta" {
-			out += ev.OutputTokens
-		}
-		if ev.Type == "text" {
-			text.WriteString(ev.Text)
-		}
-	}
-	callbackInputTokens += in
-	callbackOutputTokens += out
-	callbackAPICalls++
-	return text.String(), nil
-}
-
 func compactionChatOpenAI(messages []Message, auth *AuthMethod, sysPrompt string) (string, error) {
 	if auth != nil && auth.Token != nil {
 		reqBody := map[string]any{
@@ -519,8 +442,25 @@ func openAIModelName() string {
 	return openAIModel
 }
 
+func filterOpenAITools(tools []any) []any {
+	filtered := make([]any, 0, len(tools))
+	for _, t := range tools {
+		m, _ := t.(map[string]any)
+		fn, _ := m["function"].(map[string]any)
+		name, _ := fn["name"].(string)
+		if name == "" {
+			name, _ = m["name"].(string) // responses format
+		}
+		if codeToolOnly[name] {
+			continue
+		}
+		filtered = append(filtered, t)
+	}
+	return filtered
+}
+
 func buildOpenAITools() []any {
-	return []any{
+	return filterOpenAITools([]any{
 		map[string]any{
 			"type": "function",
 			"function": map[string]any{
@@ -753,13 +693,15 @@ func buildOpenAITools() []any {
 			"type": "function",
 			"function": map[string]any{
 				"name":        "code",
-				"description": "Execute TypeScript code with oc.* APIs: read, write, edit, glob, grep, bash, list, ask (LLM). Use for complex multi-file operations.",
+				"description": "Execute TypeScript code and save as a reusable skill. oc.* APIs: read, write, edit, glob, grep, bash, list, ask (LLM).",
 				"parameters": map[string]any{
 					"type": "object",
 					"properties": map[string]any{
-						"code": map[string]any{"type": "string", "description": "TypeScript code to execute with oc.* APIs"},
+						"code":              map[string]any{"type": "string", "description": "TypeScript code to execute"},
+						"skill_name":        map[string]any{"type": "string", "description": "Short unique name for this skill, e.g. find_todos, run_tests"},
+						"skill_description": map[string]any{"type": "string", "description": "What this code does"},
 					},
-					"required": []string{"code"},
+					"required": []string{"code", "skill_name", "skill_description"},
 				},
 			},
 		},
@@ -777,28 +719,11 @@ func buildOpenAITools() []any {
 				},
 			},
 		},
-		map[string]any{
-			"type": "function",
-			"function": map[string]any{
-				"name":        "save_skill",
-				"description": "Save TypeScript code as a reusable skill.",
-				"parameters": map[string]any{
-					"type": "object",
-					"properties": map[string]any{
-						"name":        map[string]any{"type": "string", "description": "Short unique name"},
-						"description": map[string]any{"type": "string", "description": "What the skill does"},
-						"keywords":    map[string]any{"type": "string", "description": "Space-separated keywords for matching"},
-						"code":        map[string]any{"type": "string", "description": "TypeScript code"},
-					},
-					"required": []string{"name", "description", "code"},
-				},
-			},
-		},
-	}
+	})
 }
 
 func buildOpenAIResponsesTools() []any {
-	return []any{
+	return filterOpenAITools([]any{
 		map[string]any{
 			"type":        "function",
 			"name":        "bash",
@@ -1004,13 +929,15 @@ func buildOpenAIResponsesTools() []any {
 		map[string]any{
 			"type":        "function",
 			"name":        "code",
-			"description": "Execute TypeScript code with oc.* APIs: read, write, edit, glob, grep, bash, list, ask (LLM). Use for complex multi-file operations.",
+			"description": "Execute TypeScript code and save as a reusable skill. oc.* APIs: read, write, edit, glob, grep, bash, list, ask (LLM).",
 			"parameters": map[string]any{
 				"type": "object",
 				"properties": map[string]any{
-					"code": map[string]any{"type": "string", "description": "TypeScript code to execute with oc.* APIs"},
+					"code":              map[string]any{"type": "string", "description": "TypeScript code to execute"},
+					"skill_name":        map[string]any{"type": "string", "description": "Short unique name for this skill, e.g. find_todos, run_tests"},
+					"skill_description": map[string]any{"type": "string", "description": "What this code does"},
 				},
-				"required": []string{"code"},
+				"required": []string{"code", "skill_name", "skill_description"},
 			},
 		},
 		map[string]any{
@@ -1025,22 +952,7 @@ func buildOpenAIResponsesTools() []any {
 				"required": []string{"name"},
 			},
 		},
-		map[string]any{
-			"type":        "function",
-			"name":        "save_skill",
-			"description": "Save TypeScript code as a reusable skill.",
-			"parameters": map[string]any{
-				"type": "object",
-				"properties": map[string]any{
-					"name":        map[string]any{"type": "string", "description": "Short unique name"},
-					"description": map[string]any{"type": "string", "description": "What the skill does"},
-					"keywords":    map[string]any{"type": "string", "description": "Space-separated keywords for matching"},
-					"code":        map[string]any{"type": "string", "description": "TypeScript code"},
-				},
-				"required": []string{"name", "description", "code"},
-			},
-		},
-	}
+	})
 }
 
 func buildOpenAIMessages(messages []Message, systemPrompt string) []map[string]any {
