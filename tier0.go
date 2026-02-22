@@ -145,8 +145,12 @@ type turnGuard struct {
 	maxRepeatDiscovery   int
 	doomLoopThreshold    int
 	maxEditsPerFile      int
+	seqReadThreshold     int
 	toolCalls            int
 	discoveryCalls       int
+	consecutiveReads     int
+	seqReadNudged        bool
+	pendingNudge         string
 	hasWrite             bool
 	seenCalls            map[string]int
 	editCallsPerPath     map[string]int
@@ -166,6 +170,7 @@ func newTurnGuard(auth *AuthMethod) *turnGuard {
 		maxRepeatDiscovery:   envInt("OC_MAX_REPEAT_DISCOVERY", 0),
 		doomLoopThreshold:    envInt("OC_DOOM_LOOP_THRESHOLD", 3),
 		maxEditsPerFile:      envInt("OC_MAX_EDITS_PER_FILE_PER_TURN", 0),
+		seqReadThreshold:     envInt("OC_SEQ_READ_NUDGE_THRESHOLD", 3),
 		seenCalls:            make(map[string]int),
 		editCallsPerPath:     make(map[string]int),
 	}
@@ -196,6 +201,20 @@ func (g *turnGuard) checkAndRecord(block ContentBlock) *ToolResult {
 			IsError: true,
 			Content: "Repeated discovery call blocked. Reuse existing results and proceed to edits/tests instead of repeating identical searches.",
 		}
+	}
+
+	// Track consecutive read_file/read_files calls and nudge toward code tool.
+	if block.Name == "read_file" || block.Name == "read_files" {
+		g.consecutiveReads++
+	} else {
+		g.consecutiveReads = 0
+	}
+	if g.seqReadThreshold > 0 && g.consecutiveReads >= g.seqReadThreshold && !g.seqReadNudged {
+		g.seqReadNudged = true
+		traceLog("[jit] guard: sequential read nudge after %d consecutive read calls", g.consecutiveReads)
+		// Soft nudge: append a system hint but still execute the call (return nil).
+		// The nudge is injected as a separate assistant-visible note via appendNudge.
+		g.pendingNudge = "You have made several consecutive read_file calls. Consider using the code tool with oc.read()/oc.grep()/oc.glob() to batch file operations into a single call."
 	}
 
 	if isWriteToolCall(block.Name, block.Input) {
@@ -484,6 +503,41 @@ func handleResponse(messages *[]Message, auth *AuthMethod, userInput string, pre
 
 		apiCalls++
 		prunedForAPI := pruneOldToolOutputs(apiMessages)
+
+		// Pre-flight token estimate: if messages are too large, compact before sending.
+		if apiCalls > 1 {
+			estimated := estimateTokens(sysPrompt)
+			for _, msg := range prunedForAPI {
+				estimated += estimateMessageTokens(msg)
+			}
+			limit := getContextLimit(auth)
+			if estimated > limit-maxTokens {
+				fullMessages := cloneMessages(*messages)
+				boundaryIdx := compactionBoundaryIndex(fullMessages)
+				if boundaryIdx < 0 {
+					boundaryIdx = len(fullMessages) - 1
+				}
+				summary, err := runCompaction(fullMessages, auth, sysPrompt)
+				if err != nil {
+					stopSpinner()
+					return nil, err
+				}
+				currentCompactionBoundary = boundaryIdx
+				currentCompactionSummary = summary
+				*messages = append(*messages, Message{
+					Role: "assistant",
+					Content: []ContentBlock{
+						{Type: "text", Text: fmt.Sprintf("[Context compacted at %s]", time.Now().Format(time.RFC3339))},
+						{Type: "text", Text: "Compaction summary:\n" + summary},
+					},
+				})
+				apiMessages = buildPostCompactionMessages(summary, fullMessages, boundaryIdx)
+				apiMessages = append(apiMessages, Message{Role: "user", Content: "Continue with next steps"})
+				overflowInputTokens = 0
+				prunedForAPI = pruneOldToolOutputs(apiMessages)
+			}
+		}
+
 		recorder.RecordAPIRequest(sysPrompt, prunedForAPI)
 		stream, err := streamChat(prunedForAPI, auth, sysPrompt)
 		if err != nil {
@@ -616,6 +670,11 @@ func handleResponse(messages *[]Message, auth *AuthMethod, userInput string, pre
 				if block.Type == "tool_use" {
 					llmToolCalls++
 					fmt.Println(dim(formatToolCall(block.Name, block.Input)))
+					if block.Name == "code" {
+						if code := extractCodeToolSource(block.Input); code != "" {
+							fmt.Println(renderMarkdown("```ts\n" + code + "\n```"))
+						}
+					}
 					toolStart := time.Now()
 
 					var result ToolResult
@@ -623,6 +682,15 @@ func handleResponse(messages *[]Message, auth *AuthMethod, userInput string, pre
 
 					if blocked := guard.checkAndRecord(block); blocked != nil {
 						result = *blocked
+						recorder.RecordEffect(block.Name, block.Input, result, time.Since(toolStart))
+						toolResults = append(toolResults, ContentBlock{
+							Type: "tool_result", ToolUseID: block.ID, Content: result.Content,
+						})
+						continue
+					}
+
+					if denied := CheckToolPermission(block.Name, block.Input); denied != nil {
+						result = *denied
 						recorder.RecordEffect(block.Name, block.Input, result, time.Since(toolStart))
 						toolResults = append(toolResults, ContentBlock{
 							Type: "tool_result", ToolUseID: block.ID, Content: result.Content,
@@ -660,7 +728,14 @@ func handleResponse(messages *[]Message, auth *AuthMethod, userInput string, pre
 					}
 
 					if !cached {
-						result = executeTool(block.Name, block.Input)
+						if block.Name == "bash" || block.Name == "code" {
+							showLiveOutput.Store(true)
+							toolSpinner := startSpinner(nil)
+							result = executeTool(block.Name, block.Input)
+							toolSpinner()
+						} else {
+							result = executeTool(block.Name, block.Input)
+						}
 					}
 					if cache != nil && !cached {
 						switch block.Name {
@@ -709,6 +784,15 @@ func handleResponse(messages *[]Message, auth *AuthMethod, userInput string, pre
 					})
 				}
 			}
+			// Inject soft nudge toward code tool after sequential reads.
+			if guard.pendingNudge != "" {
+				toolResults = append(toolResults, ContentBlock{
+					Type: "text",
+					Text: "<system-reminder>" + guard.pendingNudge + "</system-reminder>",
+				})
+				guard.pendingNudge = ""
+			}
+
 			toolMsg := Message{Role: "user", Content: toolResults}
 			*messages = append(*messages, toolMsg)
 			apiMessages = append(apiMessages, toolMsg)
@@ -967,11 +1051,45 @@ type ResponseStats struct {
 	ElapsedMs            float64 `json:"elapsed_ms"`
 }
 
+func extractCodeToolSource(inputJSON json.RawMessage) string {
+	var input map[string]interface{}
+	if err := json.Unmarshal(inputJSON, &input); err != nil {
+		return ""
+	}
+	code, _ := input["code"].(string)
+	return code
+}
+
 func formatToolCall(name string, inputJSON json.RawMessage) string {
 	var input map[string]interface{}
 	if err := json.Unmarshal(inputJSON, &input); err != nil {
 		return name
 	}
+
+	// Special display for code tool: show skill name/description as header
+	if name == "code" {
+		skillName, _ := input["skill_name"].(string)
+		skillDesc, _ := input["skill_description"].(string)
+
+		var label string
+		if skillName != "" {
+			label = fmt.Sprintf("code [%s]", skillName)
+		} else {
+			label = "code"
+		}
+		if skillDesc != "" {
+			label += " " + skillDesc
+		}
+		return label
+	}
+
+	// Special display for run_skill: just show the skill name
+	if name == "run_skill" {
+		if sn, ok := input["name"].(string); ok {
+			return fmt.Sprintf("run_skill(%s)", sn)
+		}
+	}
+
 	var parts []string
 	for key, value := range input {
 		if str, ok := value.(string); ok {

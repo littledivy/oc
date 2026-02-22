@@ -9,6 +9,7 @@ import (
 	"sort"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/charmbracelet/glamour"
@@ -54,6 +55,9 @@ func main() {
 			i--
 		}
 	}
+
+	initPermissions()
+	args = ApplyPermissionFlags(args)
 
 	jitEngine = NewJIT()
 	traceLog("[jit] %s", jitEngine.Stats())
@@ -124,7 +128,7 @@ func main() {
 			os.Exit(0)
 
 		case "help", "--help", "-h":
-			fmt.Println("oc — terminal coding-agent CLI\n\nUsage:\n  oc                           Start new interactive chat\n  oc resume [id]               Resume a saved session (or latest for cwd)\n  oc sessions                  List saved sessions\n  oc login                     Authenticate for active/default provider\n  oc login openai              OpenAI login (browser OAuth, device flow, or API key)\n  oc login anthropic           Authenticate with Anthropic OAuth\n  oc run <prompt>              Run a single prompt non-interactively\n  oc train-intent [options]    Train intent logreg model from history\n  oc help                      Show this help\n\nInteractive mode commands:\n  /mode                        Show current mode\n  /mode build                  Build mode (normal implementation)\n  /mode plan                   Plan mode (read-only)\n  /build                       Shortcut for /mode build\n  /plan                        Shortcut for /mode plan\n  /todos                       Show current todos\n\nTrain-intent options:\n  --claude-dir <path>          Claude data dir (default: ~/.claude)\n  --max-samples <n>            Max training samples (default: 4000)\n\nFlags:\n  --trace-jit                  Show JIT optimization trace on stderr\n\nEnvironment:\n  OC_PROVIDER               Force provider: anthropic|openai (optional)\n  ANTHROPIC_API_KEY         Anthropic API key auth (alternative to OAuth)\n  OPENAI_API_KEY            OpenAI API key auth\n  OPENAI_MODEL              OpenAI model override (default: gpt-5.1-codex-mini)\n  OC_INTENT_ONLINE_TRAIN    Enable online intent learning (1/true)")
+			fmt.Println("oc — terminal coding-agent CLI\n\nUsage:\n  oc                           Start new interactive chat\n  oc resume [id]               Resume a saved session (or latest for cwd)\n  oc sessions                  List saved sessions\n  oc login                     Authenticate for active/default provider\n  oc login openai              OpenAI login (browser OAuth, device flow, or API key)\n  oc login anthropic           Authenticate with Anthropic OAuth\n  oc run <prompt>              Run a single prompt non-interactively\n  oc train-intent [options]    Train intent logreg model from history\n  oc help                      Show this help\n\nInteractive mode commands:\n  /mode                        Show current mode\n  /mode build                  Build mode (normal implementation)\n  /mode plan                   Plan mode (read-only)\n  /build                       Shortcut for /mode build\n  /plan                        Shortcut for /mode plan\n  /todos                       Show current todos\n\nTrain-intent options:\n  --claude-dir <path>          Claude data dir (default: ~/.claude)\n  --max-samples <n>            Max training samples (default: 4000)\n\nFlags:\n  --trace-jit                  Show JIT optimization trace on stderr\n  --allow-all                  Allow all tool permissions\n  --deny-net                   Deny network access (webfetch)\n  --allow-bash                 Allow bash without prompting\n  --allow-write                Allow file writes without prompting\n  --allow-read=path,...         Scope read to specific paths\n  --allow-bash=go,cargo        Scope bash to specific commands\n\nEnvironment:\n  OC_PROVIDER               Force provider: anthropic|openai (optional)\n  ANTHROPIC_API_KEY         Anthropic API key auth (alternative to OAuth)\n  OPENAI_API_KEY            OpenAI API key auth\n  OPENAI_MODEL              OpenAI model override (default: gpt-5.1-codex-mini)\n  OC_INTENT_ONLINE_TRAIN    Enable online intent learning (1/true)")
 			return
 		}
 	}
@@ -320,6 +324,12 @@ func main() {
 }
 
 func handleCommand(input string, messages *[]Message, isNewSession bool) bool {
+	if strings.HasPrefix(input, "/permissions") {
+		rest := strings.TrimSpace(strings.TrimPrefix(input, "/permissions"))
+		HandlePermissionsCommand(rest)
+		return true
+	}
+
 	if strings.HasPrefix(input, "/mode") {
 		fields := strings.Fields(input)
 		if len(fields) == 1 {
@@ -364,7 +374,7 @@ func handleCommand(input string, messages *[]Message, isNewSession bool) bool {
 		listSessions()
 		return true
 	case "/help":
-		fmt.Println("  /save      Save session\n  /sessions  List sessions\n  /todos     Show current todos\n  /jit       Show JIT stats\n  /mode      Show or set mode (/mode build|plan)\n  /build     Switch to build mode\n  /plan      Switch to plan mode\n  /quit      Exit")
+		fmt.Println("  /save           Save session\n  /sessions       List sessions\n  /todos          Show current todos\n  /jit            Show JIT stats\n  /mode           Show or set mode (/mode build|plan)\n  /build          Shortcut for build mode\n  /plan           Shortcut for plan mode\n  /permissions    Show/set permissions (/permissions [cat] [allow|deny|ask])\n  /quit           Exit")
 		return true
 	case "/build":
 		currentMode = ModeBuild
@@ -472,6 +482,37 @@ func readLine() (string, error) {
 	}
 }
 
+// interruptWatcher coordinates pause/resume so the permission prompt can
+// safely read from stdin without racing the watcher goroutine.
+var iwMu sync.Mutex
+var iwPauseCh chan struct{} // non-nil when a watcher is active; send to request pause
+var iwResumeCh chan struct{}
+var iwPausedCh chan struct{}
+
+// pauseInterruptWatcher tells the watcher to stop reading stdin and restore
+// the terminal, then blocks until it has done so.
+func pauseInterruptWatcher() {
+	iwMu.Lock()
+	p := iwPauseCh
+	iwMu.Unlock()
+	if p == nil {
+		return
+	}
+	p <- struct{}{}
+	<-iwPausedCh // wait for watcher to acknowledge pause
+}
+
+// resumeInterruptWatcher unblocks the paused watcher so it re-enters raw mode.
+func resumeInterruptWatcher() {
+	iwMu.Lock()
+	r := iwResumeCh
+	iwMu.Unlock()
+	if r == nil {
+		return
+	}
+	r <- struct{}{}
+}
+
 func startEscInterruptWatcher(onInterrupt func()) func() {
 	fd := int(os.Stdin.Fd())
 	if !term.IsTerminal(fd) {
@@ -482,21 +523,60 @@ func startEscInterruptWatcher(onInterrupt func()) func() {
 		return func() {}
 	}
 
-	if termios, err := unix.IoctlGetTermios(fd, unix.TIOCGETA); err == nil {
-		termios.Oflag |= unix.OPOST
-		unix.IoctlSetTermios(fd, unix.TIOCSETA, termios)
+	// Re-enable OPOST for output processing, and disable VDISCARD so
+	// Ctrl+O (byte 15) passes through to the application instead of being
+	// swallowed by the macOS tty driver.
+	patchTermios := func() {
+		if termios, err := unix.IoctlGetTermios(fd, unix.TIOCGETA); err == nil {
+			termios.Oflag |= unix.OPOST
+			termios.Cc[unix.VDISCARD] = 0
+			unix.IoctlSetTermios(fd, unix.TIOCSETA, termios)
+		}
 	}
+	patchTermios()
+
+	pauseCh := make(chan struct{}, 1)
+	resumeCh := make(chan struct{}, 1)
+	pausedCh := make(chan struct{}, 1)
+	iwMu.Lock()
+	iwPauseCh = pauseCh
+	iwResumeCh = resumeCh
+	iwPausedCh = pausedCh
+	iwMu.Unlock()
 
 	stop := make(chan struct{})
 	done := make(chan struct{})
 	go func() {
 		defer close(done)
 		defer term.Restore(fd, oldState)
+		defer func() {
+			iwMu.Lock()
+			iwPauseCh = nil
+			iwResumeCh = nil
+			iwPausedCh = nil
+			iwMu.Unlock()
+		}()
 		var b [1]byte
 		for {
 			select {
 			case <-stop:
 				return
+			case <-pauseCh:
+				// Restore terminal so the permission prompt can use stdin.
+				term.Restore(fd, oldState)
+				pausedCh <- struct{}{}
+				// Block until resumed or stopped.
+				select {
+				case <-stop:
+					return
+				case <-resumeCh:
+				}
+				// Re-enter raw mode.
+				if newState, err := term.MakeRaw(fd); err == nil {
+					oldState = newState
+				}
+				patchTermios()
+				continue
 			default:
 			}
 
@@ -508,6 +588,10 @@ func startEscInterruptWatcher(onInterrupt func()) func() {
 				continue
 			}
 			if _, err := unix.Read(fd, b[:]); err != nil {
+				continue
+			}
+			if b[0] == 15 { // Ctrl+O: toggle live output
+				showLiveOutput.Store(!showLiveOutput.Load())
 				continue
 			}
 			if b[0] == 27 || b[0] == 3 { // ESC or Ctrl+C
@@ -550,19 +634,49 @@ func startSpinner(statusFn func() string) func() {
 	done := make(chan struct{})
 	finished := make(chan struct{})
 	i := 0
+	prevLines := 0 // number of output lines drawn on screen last tick
 	go func() {
 		defer close(finished)
 		for {
 			select {
 			case <-done:
-				fmt.Print("\r\033[K")
+				// Clear output lines + spinner line
+				if prevLines > 0 {
+					fmt.Printf("\033[%dA\033[J", prevLines)
+				} else {
+					fmt.Print("\r\033[K")
+				}
 				return
 			default:
 				suffix := ""
 				if statusFn != nil {
 					suffix = statusFn()
 				}
-				fmt.Printf("\r\033[1;32m%s\033[0m Thinking...%s", spinner[i%len(spinner)], suffix)
+
+				// Erase previous frame (output lines + spinner line).
+				// Cursor is at end of the spinner line from last tick.
+				if prevLines > 0 {
+					// Move up past output lines, then clear everything below.
+					fmt.Printf("\r\033[%dA\033[J", prevLines)
+				} else {
+					fmt.Print("\r\033[K")
+				}
+				prevLines = 0
+
+				// Draw live output tail if toggled on.
+				if showLiveOutput.Load() {
+					snap := getActiveCmdSnapshot(15)
+					if snap != "" {
+						lines := strings.Split(snap, "\n")
+						for _, line := range lines {
+							fmt.Printf("  \033[2m%s\033[0m\n", line)
+						}
+						prevLines = len(lines)
+					}
+				}
+
+				// Draw spinner on the bottom line.
+				fmt.Printf("\033[1;32m%s\033[0m Thinking...%s", spinner[i%len(spinner)], suffix)
 				i++
 				time.Sleep(100 * time.Millisecond)
 			}

@@ -616,17 +616,23 @@ func execCode(code string) ToolResult {
 
 	go handleAskCallbacks(ctx, callbackFile)
 
-	cmd := exec.CommandContext(ctx, denoPath, "run", "--allow-all", tmpFile.Name())
+	denoArgs := append([]string{"run"}, DenoPermFlags()...)
+	denoArgs = append(denoArgs, tmpFile.Name())
+	cmd := exec.CommandContext(ctx, denoPath, denoArgs...)
 	cmd.Env = append(os.Environ(), "OC_ASK_CALLBACK="+callbackFile)
 	cmd.Dir, _ = os.Getwd()
 
-	var stdout, stderr strings.Builder
-	cmd.Stdout = &stdout
+	lb := &liveOutputBuffer{}
+	setActiveCmdOutput(lb)
+	defer clearActiveCmdOutput()
+
+	var stderr strings.Builder
+	cmd.Stdout = lb
 	cmd.Stderr = &stderr
 
 	err = cmd.Run()
 
-	output := strings.TrimSpace(stdout.String())
+	output := strings.TrimSpace(lb.String())
 	errOutput := strings.TrimSpace(stderr.String())
 
 	var filteredErr []string
@@ -655,6 +661,7 @@ func execCode(code string) ToolResult {
 		output = "(no output)"
 	}
 
+	output = truncateToolOutput("code", output)
 	return ToolResult{Content: output, IsError: false}
 }
 

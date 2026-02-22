@@ -17,6 +17,8 @@ import (
 	"sort"
 	"strconv"
 	"strings"
+	"sync"
+	"sync/atomic"
 	"time"
 
 	"golang.org/x/net/html"
@@ -274,21 +276,15 @@ func buildRunSkillDescription() string {
 	return b.String()
 }
 
-// codeToolOnly filters out tools that the code tool subsumes, forcing the LLM
-// to use the code tool for file I/O instead of sequential read/write/list calls.
+// codeToolOnly filters out tools that the code tool subsumes.
+// save_skill is hidden because run_skill already surfaces available skills.
 var codeToolOnly = map[string]bool{
-	"read_file":  true,
-	"read_files": true,
-	"write_file": true,
-	"write_files": true,
-	"list_files":  true,
 	"save_skill": true,
 }
 
 // buildToolDefinitions returns tool definitions JSON with dynamic skill list
 // embedded in the run_skill description so the LLM sees available skills upfront.
-// Tools in codeToolOnly are hidden from the LLM but still executable via dispatch
-// (edit_file, bash, grep etc. remain available directly).
+// Tools in codeToolOnly are hidden from the LLM but still executable via dispatch.
 func buildToolDefinitions() string {
 	desc := buildRunSkillDescription()
 
@@ -321,6 +317,67 @@ var lastBashOutput string
 
 // lastEditedFile stores the absolute path of the last file written, for Ctrl+E.
 var lastEditedFile string
+
+// liveOutputBuffer is a thread-safe io.Writer that accumulates command output
+// for live display during execution.
+type liveOutputBuffer struct {
+	mu  sync.Mutex
+	buf strings.Builder
+}
+
+func (l *liveOutputBuffer) Write(p []byte) (int, error) {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	return l.buf.Write(p)
+}
+
+// Snapshot returns the last maxLines lines of accumulated output.
+func (l *liveOutputBuffer) Snapshot(maxLines int) string {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	s := l.buf.String()
+	if maxLines <= 0 || s == "" {
+		return s
+	}
+	lines := strings.Split(strings.TrimRight(s, "\n"), "\n")
+	if len(lines) > maxLines {
+		lines = lines[len(lines)-maxLines:]
+	}
+	return strings.Join(lines, "\n")
+}
+
+func (l *liveOutputBuffer) String() string {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	return l.buf.String()
+}
+
+var activeCmdOutput *liveOutputBuffer
+var activeCmdMu sync.Mutex
+var showLiveOutput atomic.Bool
+
+func setActiveCmdOutput(lb *liveOutputBuffer) {
+	activeCmdMu.Lock()
+	activeCmdOutput = lb
+	activeCmdMu.Unlock()
+}
+
+func clearActiveCmdOutput() {
+	activeCmdMu.Lock()
+	activeCmdOutput = nil
+	activeCmdMu.Unlock()
+	showLiveOutput.Store(false)
+}
+
+func getActiveCmdSnapshot(maxLines int) string {
+	activeCmdMu.Lock()
+	lb := activeCmdOutput
+	activeCmdMu.Unlock()
+	if lb == nil {
+		return ""
+	}
+	return lb.Snapshot(maxLines)
+}
 
 func executeTool(name string, inputJSON json.RawMessage) ToolResult {
 	var input map[string]string
@@ -886,9 +943,23 @@ func truncateToolOutput(tool, out string) string {
 	if maxBytes <= 0 || len(out) <= maxBytes {
 		return out
 	}
+	originalBytes := len(out)
 	trimmed := strings.TrimRight(out[:maxBytes], "\n")
-	meta := fmt.Sprintf("\n\n<tool_metadata>\ntruncated=true\ntool=%s\noriginal_bytes=%d\nreturned_bytes=%d\n</tool_metadata>", tool, len(out), len(trimmed))
-	return trimmed + meta
+
+	// Save full output to disk so the LLM can access it later.
+	dir := filepath.Join(".oc", "tool-output")
+	_ = os.MkdirAll(dir, 0o755)
+	fname := fmt.Sprintf("%d-%s.txt", time.Now().Unix(), tool)
+	fpath := filepath.Join(dir, fname)
+	savedMsg := ""
+	if err := os.WriteFile(fpath, []byte(out), 0o644); err == nil {
+		savedMsg = fmt.Sprintf("\n[Full output saved to %s]", fpath)
+	}
+
+	hint := fmt.Sprintf("\n\n[Output truncated: %d bytes total, showing first %d]%s\n[Use read_file with start_line/end_line to access specific sections]",
+		originalBytes, len(trimmed), savedMsg)
+	meta := fmt.Sprintf("\n\n<tool_metadata>\ntruncated=true\ntool=%s\noriginal_bytes=%d\nreturned_bytes=%d\n</tool_metadata>", tool, originalBytes, len(trimmed))
+	return trimmed + hint + meta
 }
 
 // execBashClean runs a command and captures output without terminal display interference.
@@ -939,8 +1010,11 @@ func execBashClean(command string) ToolResult {
 		return ToolResult{Content: fmt.Sprintf("Error: %v", err), IsError: true}
 	}
 
-	var fullOutput strings.Builder
-	scanner := bufio.NewScanner(io.TeeReader(pipe, &fullOutput))
+	lb := &liveOutputBuffer{}
+	setActiveCmdOutput(lb)
+	defer clearActiveCmdOutput()
+
+	scanner := bufio.NewScanner(io.TeeReader(pipe, lb))
 	scanner.Buffer(make([]byte, 1024*1024), 1024*1024)
 
 	for scanner.Scan() {
@@ -948,7 +1022,7 @@ func execBashClean(command string) ToolResult {
 
 	cmdErr := cmd.Wait()
 
-	result := truncateToolOutput("bash", fullOutput.String())
+	result := truncateToolOutput("bash", lb.String())
 
 	lastBashOutput = result
 
