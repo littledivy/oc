@@ -1204,15 +1204,18 @@ func execWriteFile(path, content string) ToolResult {
 
 	var display strings.Builder
 	if readErr == nil {
+		diffText := renderDiff(string(oldData), content, path)
 		display.WriteString(dim("wrote " + path + "  "))
 		display.WriteString("\033[2;7m ctrl+e to edit \033[0m")
 		display.WriteString("\n")
-		display.WriteString(renderDiff(string(oldData), content, path))
+		display.WriteString(diffText)
+		remoteBroadcastDiff(path, string(oldData), content)
 	} else {
 		display.WriteString(dim("created " + path + "  "))
 		display.WriteString("\033[2;7m ctrl+e to edit \033[0m")
 		display.WriteString("\n")
 		display.WriteString(renderNewFile(content, path))
+		remoteBroadcastNewFile(path, content)
 	}
 	fmt.Println(display.String())
 
@@ -1264,6 +1267,7 @@ func execEditFile(path, oldString, newString string) ToolResult {
 	display.WriteString("\n")
 	display.WriteString(renderDiff(content, newContent, path))
 	fmt.Println(display.String())
+	remoteBroadcastDiff(path, content, newContent)
 
 	return ToolResult{Content: fmt.Sprintf("Successfully edited %s", path), IsError: false}
 }

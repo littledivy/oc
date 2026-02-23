@@ -152,24 +152,4 @@ func bgKill(id string) string {
 	return fmt.Sprintf("Session %s killed", sess.ID)
 }
 
-// bgList returns a summary of all background sessions.
-func bgList() string {
-	bgSessionsMu.Lock()
-	defer bgSessionsMu.Unlock()
 
-	if len(bgSessions) == 0 {
-		return "No background sessions."
-	}
-
-	var b strings.Builder
-	for _, sess := range bgSessions {
-		select {
-		case <-sess.Done:
-			fmt.Fprintf(&b, "[%s] exited (code %d) — %s\n", sess.ID, sess.ExitCode, sess.Command)
-		default:
-			elapsed := time.Since(sess.StartTime).Round(time.Millisecond)
-			fmt.Fprintf(&b, "[%s] running (%s) — %s\n", sess.ID, elapsed, sess.Command)
-		}
-	}
-	return b.String()
-}

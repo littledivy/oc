@@ -434,10 +434,6 @@ func (a *AuthMethod) IsOpenAI() bool {
 	return a != nil && a.Provider == "openai"
 }
 
-func (a *AuthMethod) IsAnthropic() bool {
-	return a != nil && a.Provider == "anthropic"
-}
-
 func getAuth() (*AuthMethod, error) {
 	switch strings.ToLower(strings.TrimSpace(os.Getenv("OC_PROVIDER"))) {
 	case "openai":

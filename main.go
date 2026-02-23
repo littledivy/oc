@@ -131,7 +131,7 @@ func main() {
 			os.Exit(0)
 
 		case "help", "--help", "-h":
-			fmt.Println("oc — terminal coding-agent CLI\n\nUsage:\n  oc                           Start new interactive chat\n  oc resume [id]               Resume a saved session (or latest for cwd)\n  oc sessions                  List saved sessions\n  oc login                     Authenticate for active/default provider\n  oc login openai              OpenAI login (browser OAuth, device flow, or API key)\n  oc login anthropic           Authenticate with Anthropic OAuth\n  oc run <prompt>              Run a single prompt non-interactively\n  oc review [pr]               Review a PR (number, URL, or branch; default: current branch)\n  oc train-intent [options]    Train intent logreg model from history\n  oc help                      Show this help\n\nInteractive mode commands:\n  /mode                        Show current mode\n  /mode build                  Build mode (normal implementation)\n  /mode plan                   Plan mode (read-only)\n  /build                       Shortcut for /mode build\n  /plan                        Shortcut for /mode plan\n  /review [pr]                 Review a PR inline\n  /todos                       Show current todos\n\nTrain-intent options:\n  --claude-dir <path>          Claude data dir (default: ~/.claude)\n  --max-samples <n>            Max training samples (default: 4000)\n\nFlags:\n  --trace-jit                  Show JIT optimization trace on stderr\n  --allow-all                  Allow all tool permissions\n  --deny-net                   Deny network access (webfetch)\n  --allow-bash                 Allow bash without prompting\n  --allow-write                Allow file writes without prompting\n  --allow-read=path,...         Scope read to specific paths\n  --allow-bash=go,cargo        Scope bash to specific commands\n\nEnvironment:\n  OC_PROVIDER               Force provider: anthropic|openai (optional)\n  ANTHROPIC_API_KEY         Anthropic API key auth (alternative to OAuth)\n  OPENAI_API_KEY            OpenAI API key auth\n  OPENAI_MODEL              OpenAI model override (default: gpt-5.1-codex-mini)\n  OC_INTENT_ONLINE_TRAIN    Enable online intent learning (1/true)")
+			fmt.Println("oc — terminal coding-agent CLI\n\nUsage:\n  oc                           Start new interactive chat\n  oc resume [id]               Resume a saved session (or latest for cwd)\n  oc sessions                  List saved sessions\n  oc login                     Authenticate for active/default provider\n  oc login openai              OpenAI login (browser OAuth, device flow, or API key)\n  oc login anthropic           Authenticate with Anthropic OAuth\n  oc run <prompt>              Run a single prompt non-interactively\n  oc review [pr]               Review a PR (number, URL, or branch; default: current branch)\n  oc train-intent [options]    Train intent logreg model from history\n  oc help                      Show this help\n\nInteractive mode commands:\n  /mode                        Show current mode\n  /mode build                  Build mode (normal implementation)\n  /mode plan                   Plan mode (read-only)\n  /build                       Shortcut for /mode build\n  /plan                        Shortcut for /mode plan\n  /review [pr]                 Review a PR inline\n  /todos                       Show current todos\n  /remote                      Show remote UI URL and connected clients\n\nTrain-intent options:\n  --claude-dir <path>          Claude data dir (default: ~/.claude)\n  --max-samples <n>            Max training samples (default: 4000)\n\nFlags:\n  --trace-jit                  Show JIT optimization trace on stderr\n  --allow-all                  Allow all tool permissions\n  --deny-net                   Deny network access (webfetch)\n  --allow-bash                 Allow bash without prompting\n  --allow-write                Allow file writes without prompting\n  --allow-read=path,...         Scope read to specific paths\n  --allow-bash=go,cargo        Scope bash to specific commands\n\nEnvironment:\n  OC_PROVIDER               Force provider: anthropic|openai (optional)\n  ANTHROPIC_API_KEY         Anthropic API key auth (alternative to OAuth)\n  OPENAI_API_KEY            OpenAI API key auth\n  OPENAI_MODEL              OpenAI model override (default: gpt-5.1-codex-mini)\n  OC_INTENT_ONLINE_TRAIN    Enable online intent learning (1/true)\n  OC_RELAY_URL              Relay server URL (e.g. https://relay.example.com)\n  OC_RELAY_TOKEN            Relay auth token\n  OC_NO_REMOTE              Disable relay connection (set to 1)")
 			return
 		}
 	}
@@ -164,6 +164,8 @@ func main() {
 		}
 	}
 
+	initRemoteUI()
+
 	var messages []Message
 	currentSessionID = sessionID
 
@@ -182,11 +184,30 @@ func main() {
 	var isNewSession = sessionID == ""
 
 	for {
+		var input string
+
+		// Read from terminal in a goroutine so we can also accept remote prompts.
+		type lineResult struct {
+			text string
+			err  error
+		}
+		lineCh := make(chan lineResult, 1)
 		fmt.Print("> ")
-		input, err := readLine()
-		if err != nil {
-			handleExit(messages, isNewSession)
-			return
+		go func() {
+			text, err := readLine()
+			lineCh <- lineResult{text, err}
+		}()
+
+		select {
+		case lr := <-lineCh:
+			if lr.err != nil {
+				handleExit(messages, isNewSession)
+				return
+			}
+			input = lr.text
+		case rp := <-remotePromptCh():
+			input = rp
+			fmt.Println(dim("[remote] " + input))
 		}
 
 		input = strings.TrimSpace(input)
@@ -401,7 +422,7 @@ func handleCommand(input string, messages *[]Message, isNewSession bool) bool {
 		listSessions()
 		return true
 	case "/help":
-		fmt.Println("  /save           Save session\n  /sessions       List sessions\n  /review [pr]    Review a PR inline\n  /todos          Show current todos\n  /jit            Show JIT stats\n  /mode           Show or set mode (/mode build|plan)\n  /build          Shortcut for build mode\n  /plan           Shortcut for plan mode\n  /permissions    Show/set permissions (/permissions [cat] [allow|deny|ask])\n  /quit           Exit")
+		fmt.Println("  /save           Save session\n  /sessions       List sessions\n  /review [pr]    Review a PR inline\n  /todos          Show current todos\n  /jit            Show JIT stats\n  /mode           Show or set mode (/mode build|plan)\n  /build          Shortcut for build mode\n  /plan           Shortcut for plan mode\n  /permissions    Show/set permissions (/permissions [cat] [allow|deny|ask])\n  /remote         Show remote UI URL and status\n  /quit           Exit")
 		return true
 	case "/build":
 		currentMode = ModeBuild
@@ -413,6 +434,18 @@ func handleCommand(input string, messages *[]Message, isNewSession bool) bool {
 		return true
 	case "/jit":
 		fmt.Println(dim(jitEngine.Stats()))
+		return true
+	case "/remote":
+		relayConnMu.Lock()
+		rc := relayConn
+		relayConnMu.Unlock()
+		if rc != nil {
+			fmt.Printf("  Relay: connected to %s\n", os.Getenv("OC_RELAY_URL"))
+		} else if os.Getenv("OC_RELAY_URL") != "" {
+			fmt.Println("  Relay: disconnected (reconnecting...)")
+		} else {
+			fmt.Println("  Relay: not configured (set OC_RELAY_URL and OC_RELAY_TOKEN)")
+		}
 		return true
 	case "/todos":
 		displayTodos()

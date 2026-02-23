@@ -406,6 +406,8 @@ func looksLikeImplementationRequest(input string) bool {
 // preamble is injected into the system prompt (Tier 1+).
 // specContext is pre-fetched tool results injected into the user message (Tier 2).
 func handleResponse(messages *[]Message, auth *AuthMethod, userInput string, preamble string, specContext *string, jitMeta *JITMeta) (*ResponseStats, error) {
+	remoteBroadcastUserPrompt(userInput)
+	remoteBroadcastStatus("thinking...")
 	var liveInputTokens int64
 	var liveOutputTokens int64
 	liveSpinnerStatus := func() string {
@@ -584,6 +586,7 @@ func handleResponse(messages *[]Message, auth *AuthMethod, userInput string, pre
 			switch event.Type {
 			case "text":
 				currentText.WriteString(event.Text)
+				remoteBroadcastText(event.Text)
 			case "tool_use_start":
 				if currentText.Len() > 0 {
 					raw := currentText.String()
@@ -679,6 +682,7 @@ func handleResponse(messages *[]Message, auth *AuthMethod, userInput string, pre
 				if block.Type == "tool_use" {
 					llmToolCalls++
 					fmt.Println(dim(formatToolCall(block.Name, block.Input)))
+					remoteBroadcastToolCall(block.Name, block.Input)
 					if block.Name == "code" {
 						if code := extractCodeToolSource(block.Input); code != "" {
 							fmt.Println(renderMarkdown("```ts\n" + code + "\n```"))
@@ -692,6 +696,7 @@ func handleResponse(messages *[]Message, auth *AuthMethod, userInput string, pre
 					if blocked := guard.checkAndRecord(block); blocked != nil {
 						result = *blocked
 						recorder.RecordEffect(block.Name, block.Input, result, time.Since(toolStart))
+						remoteBroadcastToolResult(block.Name, block.ID, result)
 						toolResults = append(toolResults, ContentBlock{
 							Type: "tool_result", ToolUseID: block.ID, Content: result.Content,
 						})
@@ -701,6 +706,7 @@ func handleResponse(messages *[]Message, auth *AuthMethod, userInput string, pre
 					if denied := CheckToolPermission(block.Name, block.Input); denied != nil {
 						result = *denied
 						recorder.RecordEffect(block.Name, block.Input, result, time.Since(toolStart))
+						remoteBroadcastToolResult(block.Name, block.ID, result)
 						toolResults = append(toolResults, ContentBlock{
 							Type: "tool_result", ToolUseID: block.ID, Content: result.Content,
 						})
@@ -788,6 +794,7 @@ func handleResponse(messages *[]Message, auth *AuthMethod, userInput string, pre
 					}
 
 					recorder.RecordEffect(block.Name, block.Input, result, time.Since(toolStart))
+					remoteBroadcastToolResult(block.Name, block.ID, result)
 					toolResults = append(toolResults, ContentBlock{
 						Type: "tool_result", ToolUseID: block.ID, Content: result.Content,
 					})
@@ -907,6 +914,7 @@ func handleResponse(messages *[]Message, auth *AuthMethod, userInput string, pre
 	statsStr := fmt.Sprintf("%d API calls, %d tool calls, %d in / %d out tokens, %s",
 		apiCalls+callbackAPICalls, llmToolCalls, gi, go_, elapsed.Round(time.Millisecond))
 	fmt.Println(dim(statsStr))
+	remoteBroadcastStats(statsStr)
 
 	if err := onlineTrainIntentFromTurn(userInput, llmToolCalls > 0); err != nil && traceJIT {
 		traceLog("[jit] online intent train error: %v", err)

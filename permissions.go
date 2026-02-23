@@ -178,13 +178,6 @@ func (ps *PermissionSet) SetSession(cat PermCategory, state PermState) {
 	ps.session[cat] = &PermRule{State: state}
 }
 
-// SetSessionWithScopes records a scoped session decision.
-func (ps *PermissionSet) SetSessionWithScopes(cat PermCategory, state PermState, scopes []string) {
-	ps.mu.Lock()
-	defer ps.mu.Unlock()
-	ps.session[cat] = &PermRule{State: state, Scopes: scopes}
-}
-
 // Check returns nil if allowed, or a ToolResult error if denied.
 // For PermAsk, it prompts the user interactively.
 // resource is the specific path/host/command being accessed for scope checking.

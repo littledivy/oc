@@ -2289,16 +2289,6 @@ func extractArgs(raw json.RawMessage) map[string]string {
 	return result
 }
 
-// FindByID returns the pattern with the given ID, or nil if not found.
-func (ps *PatternStore) FindByID(id string) *Pattern {
-	for _, p := range ps.Patterns {
-		if p.ID == id {
-			return p
-		}
-	}
-	return nil
-}
-
 // RebuildAllDescriptions rebuilds the Description field on every pattern.
 func (ps *PatternStore) RebuildAllDescriptions() {
 	for _, p := range ps.Patterns {
