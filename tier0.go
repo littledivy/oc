@@ -415,6 +415,8 @@ func handleResponse(messages *[]Message, auth *AuthMethod, userInput string, pre
 	var streamMu sync.Mutex
 	var activeStream *StreamReader
 	stopInterruptWatcher := startEscInterruptWatcher(func() {
+		// Kill any running foreground command first.
+		killActiveFgCmd()
 		if interrupted.CompareAndSwap(false, true) {
 			streamMu.Lock()
 			if activeStream != nil {

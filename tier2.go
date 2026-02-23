@@ -619,8 +619,12 @@ func execCode(code string) ToolResult {
 	denoArgs := append([]string{"run"}, DenoPermFlags()...)
 	denoArgs = append(denoArgs, tmpFile.Name())
 	cmd := exec.CommandContext(ctx, denoPath, denoArgs...)
+	setSysProcAttr(cmd)
 	cmd.Env = append(os.Environ(), "OC_ASK_CALLBACK="+callbackFile)
 	cmd.Dir, _ = os.Getwd()
+
+	setActiveFgCmd(cmd)
+	defer clearActiveFgCmd()
 
 	lb := &liveOutputBuffer{}
 	setActiveCmdOutput(lb)

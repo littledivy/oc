@@ -31,7 +31,8 @@ var toolDefinitions = `[
     "input_schema": {
       "type": "object",
       "properties": {
-        "command": {"type": "string", "description": "The shell command to execute"}
+        "command": {"type": "string", "description": "The shell command to execute"},
+        "background": {"type": "string", "description": "If 'true', run the command in a background session and return immediately with a session ID. Use bash_status/bash_kill to manage."}
       },
       "required": ["command"]
     }
@@ -233,6 +234,28 @@ var toolDefinitions = `[
       },
       "required": ["name"]
     }
+  },
+  {
+    "name": "bash_status",
+    "description": "Check the status and output of a background bash session.",
+    "input_schema": {
+      "type": "object",
+      "properties": {
+        "id": {"type": "string", "description": "Background session ID (e.g. bg_1)"}
+      },
+      "required": ["id"]
+    }
+  },
+  {
+    "name": "bash_kill",
+    "description": "Kill a running background bash session.",
+    "input_schema": {
+      "type": "object",
+      "properties": {
+        "id": {"type": "string", "description": "Background session ID to kill (e.g. bg_1)"}
+      },
+      "required": ["id"]
+    }
   }
 ]`
 
@@ -310,6 +333,31 @@ func buildToolDefinitions() string {
 		return toolDefinitions
 	}
 	return string(out)
+}
+
+// activeFgCmd tracks the currently running foreground command so the interrupt
+// watcher can kill it (instead of only closing the LLM stream).
+var activeFgCmd *exec.Cmd
+var activeFgCmdMu sync.Mutex
+
+func setActiveFgCmd(cmd *exec.Cmd) {
+	activeFgCmdMu.Lock()
+	activeFgCmd = cmd
+	activeFgCmdMu.Unlock()
+}
+
+func clearActiveFgCmd() {
+	activeFgCmdMu.Lock()
+	activeFgCmd = nil
+	activeFgCmdMu.Unlock()
+}
+
+// killActiveFgCmd kills the currently running foreground command (if any).
+func killActiveFgCmd() {
+	activeFgCmdMu.Lock()
+	cmd := activeFgCmd
+	activeFgCmdMu.Unlock()
+	killCmdGroup(cmd)
 }
 
 // lastBashOutput stores the full output of the last bash command for Ctrl+O expansion.
@@ -403,7 +451,14 @@ func executeTool(name string, inputJSON json.RawMessage) ToolResult {
 
 	switch name {
 	case "bash":
+		if parseBoolLike(input["background"]) {
+			return execBashBackground(input["command"])
+		}
 		return execBashClean(input["command"])
+	case "bash_status":
+		return ToolResult{Content: bgStatus(input["id"]), IsError: false}
+	case "bash_kill":
+		return ToolResult{Content: bgKill(input["id"]), IsError: false}
 	case "grep":
 		return execGrep(input["pattern"], input["path"], input["include"], input["max_results"])
 	case "glob":
@@ -1000,6 +1055,7 @@ func execBashClean(command string) ToolResult {
 	defer cancel()
 
 	cmd := exec.CommandContext(ctx, "/bin/sh", "-c", command)
+	setSysProcAttr(cmd)
 	pipe, err := cmd.StdoutPipe()
 	if err != nil {
 		return ToolResult{Content: fmt.Sprintf("Error: %v", err), IsError: true}
@@ -1009,6 +1065,9 @@ func execBashClean(command string) ToolResult {
 	if err := cmd.Start(); err != nil {
 		return ToolResult{Content: fmt.Sprintf("Error: %v", err), IsError: true}
 	}
+
+	setActiveFgCmd(cmd)
+	defer clearActiveFgCmd()
 
 	lb := &liveOutputBuffer{}
 	setActiveCmdOutput(lb)
@@ -1044,6 +1103,21 @@ func execBashClean(command string) ToolResult {
 	}
 
 	return ToolResult{Content: result, IsError: false}
+}
+
+// execBashBackground starts a command in a background session and returns immediately.
+func execBashBackground(command string) ToolResult {
+	if isBashFileIO(command) {
+		return ToolResult{
+			Content: "Use the code tool for file operations. bash is for build/test/git/runtime commands.",
+			IsError: true,
+		}
+	}
+	sess := bgStart(command)
+	return ToolResult{
+		Content: fmt.Sprintf("Background session started: %s\nCommand: %s\nUse bash_status to check progress, bash_kill to stop.", sess.ID, sess.Command),
+		IsError: false,
+	}
 }
 
 // isBenignExitCode returns true for tools where a non-zero exit code is normal
