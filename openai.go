@@ -3,6 +3,7 @@ package main
 import (
 	"bufio"
 	"bytes"
+	"context"
 	"encoding/json"
 	"fmt"
 	"io"
@@ -17,7 +18,7 @@ const (
 	openAICodexHost = "chatgpt.com"
 )
 
-func streamChatOpenAI(messages []Message, auth *AuthMethod, systemPrompt string) (*StreamReader, error) {
+func streamChatOpenAI(ctx context.Context, messages []Message, auth *AuthMethod, systemPrompt string) (*StreamReader, error) {
 	reqBody := buildOpenAIRequestBody(messages, systemPrompt)
 	url := fmt.Sprintf("https://%s/v1/chat/completions", openAIAPIHost)
 	oauthResponses := auth != nil && auth.Token != nil
@@ -26,7 +27,7 @@ func streamChatOpenAI(messages []Message, auth *AuthMethod, systemPrompt string)
 		url = fmt.Sprintf("https://%s/backend-api/codex/responses", openAICodexHost)
 	}
 
-	req, err := http.NewRequest("POST", url, bytes.NewReader(reqBody))
+	req, err := http.NewRequestWithContext(ctx, "POST", url, bytes.NewReader(reqBody))
 	if err != nil {
 		return nil, err
 	}

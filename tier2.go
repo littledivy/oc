@@ -792,7 +792,7 @@ func codeAskLLM(ctx context.Context, prompt string) (string, error) {
 	sysPrompt := "You are a helpful assistant. Provide concise, direct answers. Do not use tools - just respond with text."
 
 	var result strings.Builder
-	stream, err := streamChat(messages, auth, sysPrompt)
+	stream, err := streamChat(ctx, messages, auth, sysPrompt)
 	if err != nil {
 		return "", err
 	}

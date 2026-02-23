@@ -1,6 +1,7 @@
 package main
 
 import (
+	"context"
 	"crypto/rand"
 	"encoding/hex"
 	"encoding/json"
@@ -414,16 +415,19 @@ func handleResponse(messages *[]Message, auth *AuthMethod, userInput string, pre
 	var interrupted atomic.Bool
 	var streamMu sync.Mutex
 	var activeStream *StreamReader
+	ctx, cancelCtx := context.WithCancel(context.Background())
+	defer cancelCtx()
 	stopInterruptWatcher := startEscInterruptWatcher(func() {
 		// Kill any running foreground command first.
 		killActiveFgCmd()
 		if interrupted.CompareAndSwap(false, true) {
+			// Cancel context first to abort in-flight HTTP requests.
+			cancelCtx()
 			streamMu.Lock()
 			if activeStream != nil {
 				activeStream.Close()
 			}
 			streamMu.Unlock()
-			fmt.Print("\r\n")
 		}
 	})
 	defer stopInterruptWatcher()
@@ -541,9 +545,12 @@ func handleResponse(messages *[]Message, auth *AuthMethod, userInput string, pre
 		}
 
 		recorder.RecordAPIRequest(sysPrompt, prunedForAPI)
-		stream, err := streamChat(prunedForAPI, auth, sysPrompt)
+		stream, err := streamChat(ctx, prunedForAPI, auth, sysPrompt)
 		if err != nil {
 			stopSpinner()
+			if interrupted.Load() {
+				return nil, fmt.Errorf("interrupted")
+			}
 			return nil, err
 		}
 		streamMu.Lock()

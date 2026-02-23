@@ -106,6 +106,9 @@ func main() {
 				sessionID = autoID
 				fmt.Fprintf(os.Stderr, "auto-resuming latest session for cwd: %s\n", sessionID)
 			}
+		case "review":
+			runReviewCommand(args[1:])
+			return
 		case "run":
 			if len(args) < 2 {
 				fmt.Fprintln(os.Stderr, "usage: oc run \"<prompt>\"")
@@ -128,7 +131,7 @@ func main() {
 			os.Exit(0)
 
 		case "help", "--help", "-h":
-			fmt.Println("oc — terminal coding-agent CLI\n\nUsage:\n  oc                           Start new interactive chat\n  oc resume [id]               Resume a saved session (or latest for cwd)\n  oc sessions                  List saved sessions\n  oc login                     Authenticate for active/default provider\n  oc login openai              OpenAI login (browser OAuth, device flow, or API key)\n  oc login anthropic           Authenticate with Anthropic OAuth\n  oc run <prompt>              Run a single prompt non-interactively\n  oc train-intent [options]    Train intent logreg model from history\n  oc help                      Show this help\n\nInteractive mode commands:\n  /mode                        Show current mode\n  /mode build                  Build mode (normal implementation)\n  /mode plan                   Plan mode (read-only)\n  /build                       Shortcut for /mode build\n  /plan                        Shortcut for /mode plan\n  /todos                       Show current todos\n\nTrain-intent options:\n  --claude-dir <path>          Claude data dir (default: ~/.claude)\n  --max-samples <n>            Max training samples (default: 4000)\n\nFlags:\n  --trace-jit                  Show JIT optimization trace on stderr\n  --allow-all                  Allow all tool permissions\n  --deny-net                   Deny network access (webfetch)\n  --allow-bash                 Allow bash without prompting\n  --allow-write                Allow file writes without prompting\n  --allow-read=path,...         Scope read to specific paths\n  --allow-bash=go,cargo        Scope bash to specific commands\n\nEnvironment:\n  OC_PROVIDER               Force provider: anthropic|openai (optional)\n  ANTHROPIC_API_KEY         Anthropic API key auth (alternative to OAuth)\n  OPENAI_API_KEY            OpenAI API key auth\n  OPENAI_MODEL              OpenAI model override (default: gpt-5.1-codex-mini)\n  OC_INTENT_ONLINE_TRAIN    Enable online intent learning (1/true)")
+			fmt.Println("oc — terminal coding-agent CLI\n\nUsage:\n  oc                           Start new interactive chat\n  oc resume [id]               Resume a saved session (or latest for cwd)\n  oc sessions                  List saved sessions\n  oc login                     Authenticate for active/default provider\n  oc login openai              OpenAI login (browser OAuth, device flow, or API key)\n  oc login anthropic           Authenticate with Anthropic OAuth\n  oc run <prompt>              Run a single prompt non-interactively\n  oc review [pr]               Review a PR (number, URL, or branch; default: current branch)\n  oc train-intent [options]    Train intent logreg model from history\n  oc help                      Show this help\n\nInteractive mode commands:\n  /mode                        Show current mode\n  /mode build                  Build mode (normal implementation)\n  /mode plan                   Plan mode (read-only)\n  /build                       Shortcut for /mode build\n  /plan                        Shortcut for /mode plan\n  /review [pr]                 Review a PR inline\n  /todos                       Show current todos\n\nTrain-intent options:\n  --claude-dir <path>          Claude data dir (default: ~/.claude)\n  --max-samples <n>            Max training samples (default: 4000)\n\nFlags:\n  --trace-jit                  Show JIT optimization trace on stderr\n  --allow-all                  Allow all tool permissions\n  --deny-net                   Deny network access (webfetch)\n  --allow-bash                 Allow bash without prompting\n  --allow-write                Allow file writes without prompting\n  --allow-read=path,...         Scope read to specific paths\n  --allow-bash=go,cargo        Scope bash to specific commands\n\nEnvironment:\n  OC_PROVIDER               Force provider: anthropic|openai (optional)\n  ANTHROPIC_API_KEY         Anthropic API key auth (alternative to OAuth)\n  OPENAI_API_KEY            OpenAI API key auth\n  OPENAI_MODEL              OpenAI model override (default: gpt-5.1-codex-mini)\n  OC_INTENT_ONLINE_TRAIN    Enable online intent learning (1/true)")
 			return
 		}
 	}
@@ -227,13 +230,15 @@ func main() {
 			event.ScriptName = plan.Script.Name
 		}
 
+		var wasInterrupted bool
+
 		switch plan.Tier {
 		case Tier3:
 			start := time.Now()
 			recorder := NewTraceRecorder(input)
 			effects, scriptErr := ExecuteScript(plan.Script, recorder)
 			if scriptErr != nil {
-				traceLog("[jit] deopt tier 3 → tier 0: %v", scriptErr)
+				traceLog("[jit] deopt tier 3 -> tier 0: %v", scriptErr)
 				jitEngine.RecordScriptFailure(plan.Script)
 				var specContext string
 				specContext = buildScriptDeoptContext(plan.Script, effects, scriptErr)
@@ -243,7 +248,11 @@ func main() {
 				stats, err := handleResponse(&messages, auth, effectiveInput, plan.Preamble, &specContext, event.ToMeta())
 				if err != nil {
 					event.Error = err.Error()
-					fmt.Fprintf(os.Stderr, "error: %v\n", err)
+					if err.Error() == "interrupted" {
+						wasInterrupted = true
+					} else {
+						fmt.Fprintf(os.Stderr, "error: %v\n", err)
+					}
 				} else {
 					event.APICalls = stats.APICalls
 					event.LLMToolCalls = stats.LLMToolCalls
@@ -283,7 +292,11 @@ func main() {
 			stats, err := handleResponse(&messages, auth, effectiveInput, plan.Preamble, &specContext, event.ToMeta())
 			if err != nil {
 				event.Error = err.Error()
-				fmt.Fprintf(os.Stderr, "error: %v\n", err)
+				if err.Error() == "interrupted" {
+					wasInterrupted = true
+				} else {
+					fmt.Fprintf(os.Stderr, "error: %v\n", err)
+				}
 			} else {
 				event.APICalls = stats.APICalls
 				event.LLMToolCalls = stats.LLMToolCalls
@@ -302,7 +315,11 @@ func main() {
 			stats, err := handleResponse(&messages, auth, effectiveInput, plan.Preamble, nil, event.ToMeta())
 			if err != nil {
 				event.Error = err.Error()
-				fmt.Fprintf(os.Stderr, "error: %v\n", err)
+				if err.Error() == "interrupted" {
+					wasInterrupted = true
+				} else {
+					fmt.Fprintf(os.Stderr, "error: %v\n", err)
+				}
 			} else {
 				event.APICalls = stats.APICalls
 				event.LLMToolCalls = stats.LLMToolCalls
@@ -311,6 +328,16 @@ func main() {
 				event.ElapsedMs = stats.ElapsedMs
 			}
 			appendJITEvent(event)
+		}
+
+		if wasInterrupted {
+			// Remove the user message that was appended before the request,
+			// so the user can retype their prompt with corrections.
+			if len(messages) > 0 && messages[len(messages)-1].Role == "user" {
+				messages = messages[:len(messages)-1]
+			}
+			fmt.Println(dim("Request cancelled. Your message was discarded -- retype to try again."))
+			continue
 		}
 
 		if currentSessionID != "" {
@@ -374,7 +401,7 @@ func handleCommand(input string, messages *[]Message, isNewSession bool) bool {
 		listSessions()
 		return true
 	case "/help":
-		fmt.Println("  /save           Save session\n  /sessions       List sessions\n  /todos          Show current todos\n  /jit            Show JIT stats\n  /mode           Show or set mode (/mode build|plan)\n  /build          Shortcut for build mode\n  /plan           Shortcut for plan mode\n  /permissions    Show/set permissions (/permissions [cat] [allow|deny|ask])\n  /quit           Exit")
+		fmt.Println("  /save           Save session\n  /sessions       List sessions\n  /review [pr]    Review a PR inline\n  /todos          Show current todos\n  /jit            Show JIT stats\n  /mode           Show or set mode (/mode build|plan)\n  /build          Shortcut for build mode\n  /plan           Shortcut for plan mode\n  /permissions    Show/set permissions (/permissions [cat] [allow|deny|ask])\n  /quit           Exit")
 		return true
 	case "/build":
 		currentMode = ModeBuild
@@ -394,6 +421,12 @@ func handleCommand(input string, messages *[]Message, isNewSession bool) bool {
 		handleExit(*messages, isNewSession)
 		os.Exit(0)
 	}
+
+	if strings.HasPrefix(input, "/review") {
+		runReviewInteractive(input)
+		return true
+	}
+
 	return false
 }
 

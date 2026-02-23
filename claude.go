@@ -3,6 +3,7 @@ package main
 import (
 	"bufio"
 	"bytes"
+	"context"
 	"crypto/rand"
 	"crypto/sha256"
 	"encoding/base64"
@@ -63,9 +64,9 @@ type StreamEvent struct {
 	CacheCreationTokens int
 }
 
-func streamChat(messages []Message, auth *AuthMethod, systemPrompt string) (*StreamReader, error) {
+func streamChat(ctx context.Context, messages []Message, auth *AuthMethod, systemPrompt string) (*StreamReader, error) {
 	if auth != nil && auth.IsOpenAI() {
-		return streamChatOpenAI(messages, auth, systemPrompt)
+		return streamChatOpenAI(ctx, messages, auth, systemPrompt)
 	}
 
 	reqBody := buildRequestBody(messages, systemPrompt)
@@ -75,7 +76,7 @@ func streamChat(messages []Message, auth *AuthMethod, systemPrompt string) (*Str
 		url += "?beta=true"
 	}
 
-	req, err := http.NewRequest("POST", url, bytes.NewReader(reqBody))
+	req, err := http.NewRequestWithContext(ctx, "POST", url, bytes.NewReader(reqBody))
 	if err != nil {
 		return nil, err
 	}
