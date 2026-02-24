@@ -1,6 +1,7 @@
 
 Active research areas:
 - [Prompt routing and tiered execution](#tiers)
+- Speculative decoding
 - Knowledge preamble
   - [CLaRa for better knowledge retrieval](#clara)
   - BGE-large reranking
